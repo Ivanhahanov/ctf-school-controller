@@ -1,0 +1,15 @@
+apiVersion: edu.ctf.school/v1
+kind: CTFTask
+metadata:
+  labels:
+    app.kubernetes.io/name: controller
+    app.kubernetes.io/managed-by: kustomize
+  name: ctftask-sample
+spec:
+  image: nginx
+  duration: 1h
+  flagConfig:
+    format: FLAG{%s}
+    scope: Personal
+  port: 80
+  studentId: test

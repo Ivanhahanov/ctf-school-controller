@@ -1,0 +1,15 @@
+## Append samples of your project ##
+resources:
+- edu_v1_ctftask.yaml
+- lab_v1_labinstance.yaml
+- lab_v1_labnetwork.yaml
+- lab_v1_labnode.yaml
+- infra_v1_labnode.yaml
+- infra_v1_labnetwork.yaml
+- lab_v1_labspace.yaml
+- core_v1_labspace.yaml
+- core_v1_labsession.yaml
+- infra_v1_labspace.yaml
+- infra_v1_labservice.yaml
+- infra_v1_task.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

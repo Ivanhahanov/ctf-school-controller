@@ -1,0 +1,141 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  - pods
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - core.ctf.school
+  resources:
+  - labsessions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - core.ctf.school
+  resources:
+  - labsessions/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - core.ctf.school
+  resources:
+  - labsessions/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - core.ctf.school
+  resources:
+  - labspaces
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - edu.ctf.school
+  resources:
+  - ctftasks
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - edu.ctf.school
+  resources:
+  - ctftasks/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - edu.ctf.school
+  resources:
+  - ctftasks/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - infra.ctf.school
+  resources:
+  - labservices
+  - labspaces
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - infra.ctf.school
+  resources:
+  - labservices/finalizers
+  - labspaces/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - infra.ctf.school
+  resources:
+  - labservices/status
+  - labspaces/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - infra.ctf.school
+  resources:
+  - tasks
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch

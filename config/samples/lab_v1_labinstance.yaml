@@ -1,0 +1,9 @@
+apiVersion: lab.ctf.school/v1
+kind: LabInstance
+metadata:
+  labels:
+    app.kubernetes.io/name: controller
+    app.kubernetes.io/managed-by: kustomize
+  name: labinstance-sample
+spec:
+  # TODO(user): Add fields here

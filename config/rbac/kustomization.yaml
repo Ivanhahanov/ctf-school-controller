@@ -1,0 +1,61 @@
+resources:
+# All RBAC will be applied under this service account in
+# the deployment namespace. You may comment out this resource
+# if your manager will use a service account that exists at
+# runtime. Be sure to update RoleBinding and ClusterRoleBinding
+# subjects if changing service account names.
+- service_account.yaml
+- role.yaml
+- role_binding.yaml
+- leader_election_role.yaml
+- leader_election_role_binding.yaml
+# The following RBAC configurations are used to protect
+# the metrics endpoint with authn/authz. These configurations
+# ensure that only authorized users and service accounts
+# can access the metrics endpoint. Comment the following
+# permissions if you want to disable this protection.
+# More info: https://book.kubebuilder.io/reference/metrics.html
+- metrics_auth_role.yaml
+- metrics_auth_role_binding.yaml
+- metrics_reader_role.yaml
+# For each CRD, "Admin", "Editor" and "Viewer" roles are scaffolded by
+# default, aiding admins in cluster management. Those roles are
+# not used by the controller itself. You can comment the following lines
+# if you do not want those helpers be installed with your Project.
+- infra_task_admin_role.yaml
+- infra_task_editor_role.yaml
+- infra_task_viewer_role.yaml
+- infra_labservice_admin_role.yaml
+- infra_labservice_editor_role.yaml
+- infra_labservice_viewer_role.yaml
+- infra_labspace_admin_role.yaml
+- infra_labspace_editor_role.yaml
+- infra_labspace_viewer_role.yaml
+- core_labsession_admin_role.yaml
+- core_labsession_editor_role.yaml
+- core_labsession_viewer_role.yaml
+- core_labspace_admin_role.yaml
+- core_labspace_editor_role.yaml
+- core_labspace_viewer_role.yaml
+- lab_labspace_admin_role.yaml
+- lab_labspace_editor_role.yaml
+- lab_labspace_viewer_role.yaml
+- infra_labnetwork_admin_role.yaml
+- infra_labnetwork_editor_role.yaml
+- infra_labnetwork_viewer_role.yaml
+- infra_labnode_admin_role.yaml
+- infra_labnode_editor_role.yaml
+- infra_labnode_viewer_role.yaml
+- lab_labnode_admin_role.yaml
+- lab_labnode_editor_role.yaml
+- lab_labnode_viewer_role.yaml
+- lab_labnetwork_admin_role.yaml
+- lab_labnetwork_editor_role.yaml
+- lab_labnetwork_viewer_role.yaml
+- lab_labinstance_admin_role.yaml
+- lab_labinstance_editor_role.yaml
+- lab_labinstance_viewer_role.yaml
+- ctftask_admin_role.yaml
+- ctftask_editor_role.yaml
+- ctftask_viewer_role.yaml
+

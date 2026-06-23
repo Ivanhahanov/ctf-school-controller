@@ -1,0 +1,174 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: labspaces.infra.ctf.school
+spec:
+  group: infra.ctf.school
+  names:
+    kind: LabSpace
+    listKind: LabSpaceList
+    plural: labspaces
+    singular: labspace
+  scope: Cluster
+  versions:
+  - name: v1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          LabSpace is the Schema for the labspaces API.
+          It is Cluster-scoped as it represents a global infrastructure template for CTF challenges.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: Spec defines the configuration and service discovery rules
+              for the lab space.
+            properties:
+              defaultTTL:
+                description: DefaultTTL defines the session duration if not specified
+                  in LabSession (e.g., "2h", "30m").
+                pattern: ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$
+                type: string
+              network:
+                description: Network defines the traffic isolation settings.
+                properties:
+                  allowInternet:
+                    default: false
+                    description: |-
+                      AllowInternet toggles whether services in this space can access the public internet.
+                      The controller should create corresponding Egress NetworkPolicies.
+                    type: boolean
+                  internalOnly:
+                    default: true
+                    description: |-
+                      InternalOnly restricts communication so that services can only talk to each other
+                      within the same session namespace.
+                    type: boolean
+                required:
+                - allowInternet
+                - internalOnly
+                type: object
+              resources:
+                description: Resources defines the ResourceQuota for the session namespace.
+                properties:
+                  limits:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: Limits defines the maximum resource consumption allowed
+                      for the whole namespace.
+                    type: object
+                  requests:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    description: Requests defines the minimum guaranteed resources
+                      for the whole namespace.
+                    type: object
+                type: object
+              serviceSelector:
+                description: |-
+                  ServiceSelector is a label query over LabServices that should be part of this lab.
+                  This allows dynamic inclusion of services based on challenge tags.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              workspace:
+                description: Workspace определяет настройки рабочего окружения (терминал,
+                  папки)
+                properties:
+                  image:
+                    description: Image — кастомный образ
+                    type: string
+                  tasks:
+                    description: Tasks — архив с заданиями
+                    type: string
+                  type:
+                    description: Type указывает на тип интерфейса (например, Terminal)
+                    enum:
+                    - Terminal
+                    - VSCode
+                    - VNC
+                    type: string
+                required:
+                - type
+                type: object
+            required:
+            - defaultTTL
+            - network
+            - resources
+            - serviceSelector
+            - workspace
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

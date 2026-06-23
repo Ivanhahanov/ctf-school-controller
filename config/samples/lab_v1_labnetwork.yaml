@@ -1,0 +1,9 @@
+apiVersion: lab.ctf.school/v1
+kind: LabNetwork
+metadata:
+  labels:
+    app.kubernetes.io/name: controller
+    app.kubernetes.io/managed-by: kustomize
+  name: labnetwork-sample
+spec:
+  # TODO(user): Add fields here
