@@ -129,8 +129,10 @@ kind-load: docker-build ## Build image and load it into the Kind cluster (IMG=ct
 	kind load docker-image ${IMG} --name $(KIND_CLUSTER)
 
 .PHONY: kind-deploy
-kind-deploy: kind-load install ## Build, load, install CRDs and deploy controller to Kind.
-	kubectl apply -k config/kind
+kind-deploy: kind-load ## Dev loop: build+load the image and restart the Flux-managed controller.
+	# Deployment manifests are owned by Flux (deploy/ in the ctfd repo); here we
+	# just push a new image and restart so the :latest is picked up.
+	kubectl -n controller-system rollout restart deployment/controller-controller-manager
 	kubectl -n controller-system rollout status deployment/controller-controller-manager --timeout=120s
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
