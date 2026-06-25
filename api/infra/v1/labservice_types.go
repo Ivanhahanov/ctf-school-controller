@@ -92,6 +92,14 @@ type LabServiceSpec struct {
 	// +optional
 	Env []EnvVar `json:"env,omitempty"`
 
+	// Command overrides the container entrypoint.
+	// +optional
+	Command []string `json:"command,omitempty"`
+
+	// Args are the arguments passed to the command.
+	// +optional
+	Args []string `json:"args,omitempty"`
+
 	// Resources defines CPU and Memory constraints for this service.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`

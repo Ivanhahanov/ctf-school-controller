@@ -30,6 +30,7 @@ import (
 	infrav1 "ctf.school/controller/api/infra/v1"
 	"golang.org/x/exp/rand"
 	corev1 "k8s.io/api/core/v1"
+	netv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -57,7 +58,8 @@ type LabSessionReconciler struct {
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labsessions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labspaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=infra.ctf.school,resources=labservices;tasks,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=namespaces;pods;services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces;pods;services;configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labsessions/finalizers,verbs=update
 
 func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -107,6 +109,23 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.ensureNamespace(ctx, targetNamespace, session); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Isolate the session namespace (Cilium enforces this): no cross-namespace
+	// traffic except the gateway/metrics ingress and DNS/internet egress.
+	if err := r.ensureNetworkPolicy(ctx, targetNamespace, space, session); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 5b. Fast in-place restart: if a restart was requested after the current
+	// pods were created, delete those pods now and let this reconcile recreate
+	// them. Far quicker than tearing down and rebuilding the whole session.
+	if restarted, err := r.maybeRestart(ctx, session, targetNamespace); err != nil {
+		return ctrl.Result{}, err
+	} else if restarted {
+		session.Status.Phase = "Pending"
+		session.Status.Message = "Restarting lab…"
+		_ = r.Status().Update(ctx, session)
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
 
 	// 6. Discovery & Resource Reconciliation
 	services := &infrav1.LabServiceList{}
@@ -126,8 +145,12 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		if err := r.reconcileServiceResources(ctx, targetNamespace, &svcTemplate, session); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.reconcileRoute(ctx, targetNamespace, svcTemplate, session); err != nil {
-			return ctrl.Result{}, err
+		// Only expose challenge services through the gateway when the space allows external
+		// access. Internal-only spaces keep services reachable only from the workspace pod.
+		if !space.Spec.Network.InternalOnly {
+			if err := r.reconcileRoute(ctx, targetNamespace, svcTemplate, session); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
@@ -163,10 +186,12 @@ func (r *LabSessionReconciler) syncStatus(
 	if err := r.List(ctx, podList, client.InNamespace(ns)); err != nil {
 		return ctrl.Result{}, err
 	}
-	oldPhase := session.Status.Phase
 	newPhase, newMsg := r.computePhase(podList)
 
-	if oldPhase != newPhase {
+	// Update when EITHER the phase or the message changes, so the granular
+	// provisioning messages (image pull, starting, waiting-ready…) all surface
+	// to the user instead of a single static "Pending".
+	if session.Status.Phase != newPhase || session.Status.Message != newMsg {
 		session.Status.Phase = newPhase
 		session.Status.Message = newMsg
 		changed = true
@@ -179,7 +204,8 @@ func (r *LabSessionReconciler) syncStatus(
 	if domain == "" {
 		domain = "ctf.school"
 	}
-	worksapceHost := fmt.Sprintf("http://workspace-%s-%s.%s", cleanDNSName(session.Spec.UserId), cleanDNSName(session.Spec.LabSpaceRef), domain)
+	scheme := envDefault("CTF_SCHEME", "http")
+	worksapceHost := scheme + "://" + workspaceHostname(session, domain)
 
 	workspaceType := "Terminal"
 	if space.Spec.Workspace.Type == "VNC" {
@@ -194,14 +220,19 @@ func (r *LabSessionReconciler) syncStatus(
 		},
 	}
 
-	for _, svc := range svcs {
-		if svc.Spec.Exposure != nil {
-			addr := fmt.Sprintf("https://%s-%s.web.%s", svc.Name, session.Spec.UserId, domain)
-			newEndpoints = append(newEndpoints, ctfcorev1.Endpoint{
-				ServiceName: svc.Name,
-				Type:        svc.Spec.Exposure.Type,
-				Address:     addr,
-			})
+	// Services are only published as external endpoints when the space is NOT internal-only.
+	// For internal-only spaces the challenge services are reachable solely from inside the
+	// workspace (via in-cluster ClusterIP); the workspace is the single entry point.
+	if !space.Spec.Network.InternalOnly {
+		for _, svc := range svcs {
+			if svc.Spec.Exposure != nil {
+				addr := fmt.Sprintf("%s://%s-%s.web.%s", scheme, svc.Name, session.Spec.UserId, domain)
+				newEndpoints = append(newEndpoints, ctfcorev1.Endpoint{
+					ServiceName: svc.Name,
+					Type:        svc.Spec.Exposure.Type,
+					Address:     addr,
+				})
+			}
 		}
 	}
 
@@ -216,7 +247,9 @@ func (r *LabSessionReconciler) syncStatus(
 		}
 	}
 
-	requeueAfter := 5 * time.Second
+	// Poll quickly while the lab is coming up (snappy, granular feedback), and
+	// back off once it is settled and Running.
+	requeueAfter := 2 * time.Second
 	if session.Status.Phase == "Running" {
 		requeueAfter = time.Minute
 	}
@@ -229,32 +262,156 @@ func (r *LabSessionReconciler) syncStatus(
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
+// computePhase returns a phase (restricted to the CRD's enum:
+// Pending/Running/Failed/Terminating/Expired) plus a granular human message.
+// The varied feedback lives in the message; the phase stays enum-valid.
 func (r *LabSessionReconciler) computePhase(podList *corev1.PodList) (phase, message string) {
 	if len(podList.Items) == 0 {
-		return "Pending", "Starting infrastructure units..."
+		return "Pending", "Provisioning lab environment…"
 	}
 
 	for _, pod := range podList.Items {
-		// Init-контейнер ещё работает
+		// A terminating pod (e.g. mid-restart) still reports Running with ready
+		// containers until it is actually killed. Treat it as not-ready so the
+		// phase does NOT settle to Running (which would back the requeue off to a
+		// minute and stall recreation) — keep it Pending for a fast turnaround.
+		if pod.DeletionTimestamp != nil {
+			return "Pending", "Recreating the workspace…"
+		}
+
+		// Init container (provisioner) still working.
 		for _, s := range pod.Status.InitContainerStatuses {
 			if s.Name == "provisioner" && s.State.Running != nil {
-				return "Provisioning", "Downloading task assets..."
+				return "Pending", "Downloading task assets…"
 			}
 		}
 
-		if pod.Status.Phase != corev1.PodRunning {
-			return "Pending", "Starting infrastructure units..."
+		// Inspect waiting containers for a granular message. A large desktop
+		// image sits in ContainerCreating while it is pulled, so call that out
+		// explicitly — otherwise users think it is stuck.
+		for _, cs := range pod.Status.ContainerStatuses {
+			w := cs.State.Waiting
+			if w == nil {
+				continue
+			}
+			switch {
+			case w.Reason == "ImagePullBackOff" || w.Reason == "ErrImagePull":
+				return "Pending", "Pulling desktop image…"
+			case w.Reason == "CrashLoopBackOff":
+				return "Failed", "A container keeps crashing. Try Restart."
+			case w.Reason == "ContainerCreating" || w.Reason == "PodInitializing":
+				return "Pending", "Pulling image & starting the desktop (first run can take a minute)…"
+			default:
+				return "Pending", "Starting containers…"
+			}
 		}
 
-		// Проверяем Ready всех контейнеров — включая агента с его readinessProbe
+		if pod.Status.Phase == corev1.PodFailed {
+			return "Failed", "The lab failed to start. Try Restart."
+		}
+		if pod.Status.Phase != corev1.PodRunning {
+			return "Pending", "Scheduling workspace…"
+		}
+	}
+
+	// Every pod is Running — wait for readiness probes (desktop + guard).
+	for _, pod := range podList.Items {
 		for _, cs := range pod.Status.ContainerStatuses {
 			if !cs.Ready {
-				return "Provisioning", "Preparing task environment..."
+				return "Pending", "Waiting for the desktop to become ready…"
 			}
 		}
 	}
 
 	return "Running", "Lab ready."
+}
+
+// maybeRestart deletes the current pods (so the normal reconcile recreates them
+// fresh) when a restart has been requested but not yet handled. It marks the
+// request handled via an annotation, so the decision is a plain string compare —
+// no timestamps, no clock-skew sensitivity, no re-delete loop. Returns true when
+// it performed a restart.
+func (r *LabSessionReconciler) maybeRestart(ctx context.Context, session *ctfcorev1.LabSession, ns string) (bool, error) {
+	requested := session.Annotations[restartRequestedAnnotation]
+	if requested == "" || requested == session.Annotations[restartHandledAnnotation] {
+		return false, nil
+	}
+
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(ns)); err != nil {
+		return false, err
+	}
+	grace := labPodGraceSeconds
+	for i := range podList.Items {
+		p := &podList.Items[i]
+		if p.DeletionTimestamp == nil {
+			_ = r.Delete(ctx, p, &client.DeleteOptions{GracePeriodSeconds: &grace})
+		}
+	}
+
+	// Record that we handled this request so we don't loop.
+	if session.Annotations == nil {
+		session.Annotations = map[string]string{}
+	}
+	session.Annotations[restartHandledAnnotation] = requested
+	if err := r.Update(ctx, session); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// nsSelector matches a namespace by its auto-applied metadata.name label.
+func nsSelector(name string) *metav1.LabelSelector {
+	return &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": name}}
+}
+
+// ensureNetworkPolicy locks a session namespace down to the minimum: a team's
+// lab pods can talk to each other and to DNS, can be reached by the gateway
+// (workspace) and by vmagent (metrics), and reach the internet only when the
+// LabSpace allows it — but cannot reach CTFd, the database, kube internals, or
+// any OTHER team's lab namespace. Cilium enforces it.
+func (r *LabSessionReconciler) ensureNetworkPolicy(ctx context.Context, ns string, space *infrav1.LabSpace, session *ctfcorev1.LabSession) error {
+	tcp, udp := corev1.ProtocolTCP, corev1.ProtocolUDP
+	guard := intstr.FromInt(int(guardPort))
+	dns := intstr.FromInt(53)
+
+	np := &netv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "lab-isolation", Namespace: ns}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+		if err := ctrl.SetControllerReference(session, np, r.Scheme); err != nil {
+			return err
+		}
+		np.Spec = netv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{}, // all pods in the namespace
+			PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeIngress, netv1.PolicyTypeEgress},
+			Ingress: []netv1.NetworkPolicyIngressRule{
+				{From: []netv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}}}, // intra-namespace
+				{ // gateway (workspace) + vmagent (metrics) → guard port
+					From: []netv1.NetworkPolicyPeer{
+						{NamespaceSelector: nsSelector("envoy-gateway-system")},
+						{NamespaceSelector: nsSelector("monitoring")},
+					},
+					Ports: []netv1.NetworkPolicyPort{{Protocol: &tcp, Port: &guard}},
+				},
+			},
+			Egress: []netv1.NetworkPolicyEgressRule{
+				{To: []netv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}}}, // intra-namespace
+				{ // DNS
+					To:    []netv1.NetworkPolicyPeer{{NamespaceSelector: nsSelector("kube-system")}},
+					Ports: []netv1.NetworkPolicyPort{{Protocol: &udp, Port: &dns}, {Protocol: &tcp, Port: &dns}},
+				},
+			},
+		}
+		if space.Spec.Network.AllowInternet {
+			np.Spec.Egress = append(np.Spec.Egress, netv1.NetworkPolicyEgressRule{
+				To: []netv1.NetworkPolicyPeer{{IPBlock: &netv1.IPBlock{
+					CIDR:   "0.0.0.0/0",
+					Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
+				}}},
+			})
+		}
+		return nil
+	})
+	return err
 }
 
 func (r *LabSessionReconciler) ensureNamespace(ctx context.Context, name string, owner *ctfcorev1.LabSession) error {
@@ -274,25 +431,45 @@ func (r *LabSessionReconciler) ensureNamespace(ctx context.Context, name string,
 	}
 	return err
 }
+// workspaceHostname is the per-session external host for the workspace. It must
+// be unique per LabSession (session.Name already is: lab-<salt>-c<challengeID>),
+// otherwise two challenges sharing a LabSpace would produce colliding HTTPRoutes.
+func workspaceHostname(session *ctfcorev1.LabSession, domain string) string {
+	base := strings.TrimPrefix(session.Name, "lab-")
+	return fmt.Sprintf("workspace-%s.%s", cleanDNSName(base), domain)
+}
+
+// gatewayParentRef points session routes at the shared CTFd gateway. Name and
+// namespace are env-overridable; defaults match k8s/gateway (Gateway "ctfd" in
+// namespace "ctfd"). The previous hardcoded "external-gateway"/"gateway-system"
+// did not exist, so workspace routes never attached → 404.
+func gatewayParentRef() gatewayv1.ParentReference {
+	name := os.Getenv("CTF_GATEWAY_NAME")
+	if name == "" {
+		name = "ctfd"
+	}
+	nsStr := os.Getenv("CTF_GATEWAY_NAMESPACE")
+	if nsStr == "" {
+		nsStr = "ctfd"
+	}
+	ns := gatewayv1.Namespace(nsStr)
+	return gatewayv1.ParentReference{
+		Name:      gatewayv1.ObjectName(name),
+		Namespace: &ns,
+	}
+}
+
 func (r *LabSessionReconciler) reconcileWorkspaceRoute(ctx context.Context, ns string, space *infrav1.LabSpace, session *ctfcorev1.LabSession) error {
 	domain := os.Getenv("CTF_DOMAIN")
 	if domain == "" {
 		domain = "ctf.school" // Дефолтное значение
 	}
 
-	// Очищаем имена для соответствия RFC 1123 (DNS Label)
-	username := cleanDNSName(session.Spec.UserId)
-	labname := cleanDNSName(session.Spec.LabSpaceRef)
+	// Unique per session so challenges sharing a LabSpace don't collide.
+	hostname := gatewayv1.Hostname(workspaceHostname(session, domain))
 
-	// Формируем домен по ТЗ: workspace-<username>-<labname>.<domain>
-	vhost := fmt.Sprintf("workspace-%s-%s.%s", username, labname, domain)
-	hostname := gatewayv1.Hostname(vhost)
-	gatewayNS := gatewayv1.Namespace("gateway-system")
-
-	targetPort := int32(7681) // по умолчанию ttyd
-	if space.Spec.Workspace.Type == "VNC" {
-		targetPort = int32(6901)
-	}
+	// Маршрутизируем на guard-сайдкар, а не на сырой порт десктопа.
+	targetPort := guardPort
 
 	workspaceSvcName := fmt.Sprintf("workspace-%s", session.Name)
 
@@ -309,10 +486,7 @@ func (r *LabSessionReconciler) reconcileWorkspaceRoute(ctx context.Context, ns s
 			return err
 		}
 
-		route.Spec.CommonRouteSpec.ParentRefs = []gatewayv1.ParentReference{{
-			Name:      "external-gateway",
-			Namespace: &gatewayNS,
-		}}
+		route.Spec.CommonRouteSpec.ParentRefs = []gatewayv1.ParentReference{gatewayParentRef()}
 		route.Spec.Hostnames = []gatewayv1.Hostname{hostname}
 		route.Spec.Rules = []gatewayv1.HTTPRouteRule{{
 			BackendRefs: []gatewayv1.HTTPBackendRef{
@@ -320,7 +494,7 @@ func (r *LabSessionReconciler) reconcileWorkspaceRoute(ctx context.Context, ns s
 					BackendRef: gatewayv1.BackendRef{
 						BackendObjectReference: gatewayv1.BackendObjectReference{
 							Name: gatewayv1.ObjectName(workspaceSvcName),
-							Port: (*gatewayv1.PortNumber)(ptrInt32(targetPort)), // Порт ttyd по умолчанию
+							Port: (*gatewayv1.PortNumber)(ptrInt32(targetPort)),
 						},
 					},
 				},
@@ -350,9 +524,11 @@ func (r *LabSessionReconciler) reconcileWorkspace(
 	// Без агента провизия тасок через S3 внутри этого пода работать не будет, учтите это
 	podName := fmt.Sprintf("workspace-%s", session.Name)
 
-	// Собираем контейнеры динамически
+	// Собираем контейнеры динамически. Guard-сайдкар фронтит десктоп: проверяет
+	// team-scoped токен и инжектит watermark + защиту от захвата экрана.
 	containers := []corev1.Container{
 		r.buildWorkspaceInterface(space, tasks, session),
+		guardSidecar(space, session),
 	}
 
 	// Добавляем агент (checker) ТОЛЬКО если это не VNC (или если тип Terminal)
@@ -372,8 +548,9 @@ func (r *LabSessionReconciler) reconcileWorkspace(
 			},
 		},
 		Spec: corev1.PodSpec{
-			Volumes:    volumes,
-			Containers: containers,
+			Volumes:                       volumes,
+			Containers:                    containers,
+			TerminationGracePeriodSeconds: ptrInt64(labPodGraceSeconds),
 		},
 	}
 
@@ -401,28 +578,15 @@ func (r *LabSessionReconciler) ensureWorkspaceService(ctx context.Context, ns, p
 		}
 		svc.Spec.Selector = map[string]string{"app": podName}
 
-		// Настраиваем порты динамически
-		if space.Spec.Workspace.Type == "VNC" {
-			svc.Spec.Ports = []corev1.ServicePort{
-				{
-					Name:       "novnc",
-					Port:       6901,
-					TargetPort: intstr.FromInt(6901),
-				},
-			}
-		} else {
-			svc.Spec.Ports = []corev1.ServicePort{
-				{
-					Name:       "ttyd",
-					Port:       7681,
-					TargetPort: intstr.FromInt(7681),
-				},
-			}
-			// Добавляем чекер, только если он есть (не VNC)
-			svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{
-				Name: "checker",
-				Port: 8888,
-			})
+		// Внешний трафик всегда идёт через guard-сайдкар (порт 8080), который
+		// проксирует на десктоп и инжектит защиту. Сырой порт десктопа наружу
+		// не публикуется.
+		svc.Spec.Ports = []corev1.ServicePort{
+			{
+				Name:       "web",
+				Port:       guardPort,
+				TargetPort: intstr.FromInt(int(guardPort)),
+			},
 		}
 		return nil
 	})
@@ -450,9 +614,10 @@ func (r *LabSessionReconciler) buildWorkspaceInterface(space *infrav1.LabSpace, 
 	}
 
 	container := corev1.Container{
-		Name:       "interface",
-		Image:      image,
-		WorkingDir: "/workspace",
+		Name:            "interface",
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		WorkingDir:      "/workspace",
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "workspace-storage", MountPath: "/workspace"},
 		},
@@ -604,11 +769,14 @@ func (r *LabSessionReconciler) reconcileServiceResources(ctx context.Context, ns
 			},
 		},
 		Spec: corev1.PodSpec{
+			TerminationGracePeriodSeconds: ptrInt64(labPodGraceSeconds),
 			Containers: []corev1.Container{
 				{
 					Name:            "challenge",
 					Image:           labSvc.Spec.Image,
 					ImagePullPolicy: labSvc.Spec.ImagePullPolicy,
+					Command:         labSvc.Spec.Command,
+					Args:            labSvc.Spec.Args,
 					Ports:           labSvc.Spec.Ports,
 					Env:             envVars,
 					Resources:       labSvc.Spec.Resources,
@@ -690,8 +858,11 @@ func (r *LabSessionReconciler) reconcileRoute(ctx context.Context, ns string, la
 		return nil
 	}
 
-	hostname := gatewayv1.Hostname(fmt.Sprintf("%s-%s.web.ctf.school", labSvc.Name, session.Spec.UserId))
-	gatewayNS := gatewayv1.Namespace("gateway-system") // создаем переменную типа
+	domain := os.Getenv("CTF_DOMAIN")
+	if domain == "" {
+		domain = "ctf.school"
+	}
+	hostname := gatewayv1.Hostname(fmt.Sprintf("%s-%s.web.%s", labSvc.Name, session.Spec.UserId, domain))
 
 	route := &gatewayv1.HTTPRoute{
 		ObjectMeta: metav1.ObjectMeta{
@@ -701,10 +872,7 @@ func (r *LabSessionReconciler) reconcileRoute(ctx context.Context, ns string, la
 	}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, route, func() error {
-		route.Spec.CommonRouteSpec.ParentRefs = []gatewayv1.ParentReference{{
-			Name:      "external-gateway",
-			Namespace: &gatewayNS, // передаем указатель на типизированную переменную
-		}}
+		route.Spec.CommonRouteSpec.ParentRefs = []gatewayv1.ParentReference{gatewayParentRef()}
 		route.Spec.Hostnames = []gatewayv1.Hostname{hostname}
 
 		// Исправленная вложенность BackendRefs
@@ -728,6 +896,22 @@ func (r *LabSessionReconciler) reconcileRoute(ctx context.Context, ns string, la
 // Helpers for pointers
 func ptrString(s string) *string { return &s }
 func ptrInt32(i int32) *int32    { return &i }
+func ptrInt64(i int64) *int64    { return &i }
+
+// labPodGraceSeconds is the termination grace period for ephemeral lab pods.
+// The default of 30s makes Stop/Restart feel sluggish; these pods hold no state
+// worth draining, so kill them almost immediately.
+const labPodGraceSeconds int64 = 2
+
+// Restart is requested by bumping restartRequestedAnnotation (any new value).
+// The controller records the value it acted on in restartHandledAnnotation and
+// only restarts when the two differ — a string compare, immune to clock skew.
+// A restart recreates just the pods in place, reusing the namespace/services/
+// routes instead of tearing the whole session down and rebuilding it.
+const (
+	restartRequestedAnnotation = "ctf.school/restart-requested-at"
+	restartHandledAnnotation   = "ctf.school/restart-handled"
+)
 
 func (r *LabSessionReconciler) buildEnvVars(labSvc *infrav1.LabService, session *ctfcorev1.LabSession) []corev1.EnvVar {
 	var result []corev1.EnvVar
@@ -768,11 +952,14 @@ func generateRandomString(n int) string {
 }
 
 // hash generating a deterministic string based on UserId and a secret
+// hash derives the flag digest. It MUST match CTFd's _derive_flag:
+// HMAC-SHA256(CTF_SCHOOL_SECRET, flagService+salt)[:12]. The secret comes from
+// the env so both sides share one source of truth (default kept for safety).
 func hash(input string) string {
-	secret := "ctf-school-secret-key" // В продакшене брать из ENV или Secret
+	secret := envDefault("CTF_SCHOOL_SECRET", "ctf-school-secret-key")
 	h := hmac.New(sha256.New, []byte(secret))
 	h.Write([]byte(input))
-	return hex.EncodeToString(h.Sum(nil))[:12] // Берем первые 12 символов для компактности
+	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
 func (r *LabSessionReconciler) createOrUpdatePod(ctx context.Context, pod *corev1.Pod) error {

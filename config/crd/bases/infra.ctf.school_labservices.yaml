@@ -101,6 +101,16 @@ spec:
                 - targetPort
                 - type
                 type: object
+              args:
+                description: Args are the arguments passed to the command.
+                items:
+                  type: string
+                type: array
+              command:
+                description: Command overrides the container entrypoint.
+                items:
+                  type: string
+                type: array
               image:
                 description: Image is the Docker image repository and tag.
                 type: string

@@ -40,6 +40,10 @@ type WorkspaceConfig struct {
 	// Tasks — архив с заданиями
 	// +optional
 	Tasks string `json:"tasks,omitempty"`
+	// Port is the port the workspace image serves its web UI (noVNC/ttyd) on.
+	// Defaults to 6901 for VNC and 7681 for Terminal when unset.
+	// +optional
+	Port int32 `json:"port,omitempty"`
 }
 
 // NetworkConfig defines the network isolation rules for the lab session.

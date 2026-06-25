@@ -145,6 +145,12 @@ spec:
                   image:
                     description: Image — кастомный образ
                     type: string
+                  port:
+                    description: |-
+                      Port is the port the workspace image serves its web UI (noVNC/ttyd) on.
+                      Defaults to 6901 for VNC and 7681 for Terminal when unset.
+                    format: int32
+                    type: integer
                   tasks:
                     description: Tasks — архив с заданиями
                     type: string
