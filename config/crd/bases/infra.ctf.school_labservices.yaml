@@ -41,6 +41,56 @@ spec:
           spec:
             description: Spec defines the configuration of the service blueprint.
             properties:
+              egress:
+                description: |-
+                  Egress is a per-service allow-list of external destinations this
+                  service may reach. Additive on top of the LabSpace network policy and
+                  scoped to this service's pods only; empty means no outbound internet
+                  access. Requires the Cilium CNI.
+                items:
+                  description: |-
+                    EgressRule allow-lists outbound traffic from a single LabService
+                    to a specific external destination.
+                  properties:
+                    cidrs:
+                      description: CIDRs is a list of IP ranges the service may reach,
+                        e.g. "203.0.113.0/24".
+                      items:
+                        type: string
+                      type: array
+                    fqdns:
+                      description: |-
+                        FQDNs is a list of DNS names the service may reach, e.g.
+                        "api.deepseek.com". A leading "*." wildcard is supported.
+                      items:
+                        type: string
+                      type: array
+                    ports:
+                      description: Ports restricts this rule to specific destination
+                        ports. Empty means all ports.
+                      items:
+                        description: EgressPort restricts an EgressRule to a specific
+                          destination port/protocol.
+                        properties:
+                          port:
+                            description: Port is the destination port number.
+                            format: int32
+                            maximum: 65535
+                            minimum: 1
+                            type: integer
+                          protocol:
+                            default: TCP
+                            description: Protocol is TCP or UDP. Defaults to TCP.
+                            enum:
+                            - TCP
+                            - UDP
+                            type: string
+                        required:
+                        - port
+                        type: object
+                      type: array
+                  type: object
+                type: array
               env:
                 description: Env is a list of environment variables to set in the
                   container.

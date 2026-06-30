@@ -20,7 +20,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strings"
@@ -33,7 +33,9 @@ import (
 	netv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -60,6 +62,7 @@ type LabSessionReconciler struct {
 // +kubebuilder:rbac:groups=infra.ctf.school,resources=labservices;tasks,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces;pods;services;configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cilium.io,resources=ciliumnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labsessions/finalizers,verbs=update
 
 func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -412,6 +415,171 @@ func (r *LabSessionReconciler) ensureNetworkPolicy(ctx context.Context, ns strin
 		return nil
 	})
 	return err
+}
+
+// ciliumNetworkPolicyGVK identifies the Cilium CNP CRD. We render it as an
+// unstructured object so the controller needs no compile-time dependency on the
+// Cilium API module — the CRD is provided by the cluster's CNI.
+var ciliumNetworkPolicyGVK = schema.GroupVersionKind{
+	Group:   "cilium.io",
+	Version: "v2",
+	Kind:    "CiliumNetworkPolicy",
+}
+
+// ensureServiceEgressPolicy renders a per-service CiliumNetworkPolicy that
+// allow-lists the exact external destinations declared in LabService.Spec.Egress
+// (FQDNs and/or CIDRs), scoped to that service's pods only. This is additive on
+// top of the namespace-wide lab-isolation policy, so it grants a single service
+// access to e.g. api.deepseek.com without opening LabSpace-wide AllowInternet.
+//
+// When the service declares no egress rules we delete any stale policy, keeping
+// the operation idempotent. FQDN matching relies on Cilium's DNS proxy, so every
+// policy also permits DNS to kube-dns with L7 visibility (rules.dns matchPattern).
+func (r *LabSessionReconciler) ensureServiceEgressPolicy(ctx context.Context, ns string, labSvc *infrav1.LabService, session *ctfcorev1.LabSession) error {
+	name := "egress-" + labSvc.Name
+	cnp := &unstructured.Unstructured{}
+	cnp.SetGroupVersionKind(ciliumNetworkPolicyGVK)
+	cnp.SetName(name)
+	cnp.SetNamespace(ns)
+
+	// No rules → ensure no leftover policy exists.
+	if len(labSvc.Spec.Egress) == 0 {
+		err := r.Delete(ctx, cnp)
+		if err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	}
+
+	// Base egress every service keeps: reach sibling pods/workspace in the same
+	// namespace, and resolve DNS via kube-dns (with the L7 visibility Cilium's
+	// toFQDNs needs). The external destinations follow.
+	egress := []interface{}{
+		map[string]interface{}{"toEndpoints": []interface{}{map[string]interface{}{}}},
+		dnsEgressRule(),
+	}
+	for _, rule := range labSvc.Spec.Egress {
+		if e := fqdnEgressRule(rule); e != nil {
+			egress = append(egress, e)
+		}
+		if e := cidrEgressRule(rule); e != nil {
+			egress = append(egress, e)
+		}
+	}
+
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cnp, func() error {
+		if err := ctrl.SetControllerReference(session, cnp, r.Scheme); err != nil {
+			return err
+		}
+		spec := map[string]interface{}{
+			"endpointSelector": map[string]interface{}{
+				"matchLabels": map[string]interface{}{"ctf.school/svc": labSvc.Name},
+			},
+			// Selecting an endpoint for egress puts it in egress default-deny. Adding
+			// any egress rule does NOT touch ingress, but a Cilium policy that also
+			// declares ingress flips the endpoint into ingress default-deny — so we
+			// must restate the intra-namespace allow here, otherwise the workspace
+			// (and sibling services) lose access to this service. This keeps the
+			// per-service policy self-contained instead of silently depending on the
+			// namespace-wide lab-isolation NetworkPolicy.
+			"ingress": []interface{}{
+				map[string]interface{}{
+					// Empty endpoint selector = every endpoint in THIS namespace
+					// (Cilium scopes it to the policy's namespace automatically).
+					"fromEndpoints": []interface{}{map[string]interface{}{}},
+				},
+			},
+			"egress": egress,
+		}
+		return unstructured.SetNestedField(cnp.Object, spec, "spec")
+	})
+	return err
+}
+
+// dnsEgressRule lets the service resolve names via kube-dns and gives Cilium's
+// DNS proxy the visibility it needs to populate the toFQDNs IP cache.
+func dnsEgressRule() map[string]interface{} {
+	return map[string]interface{}{
+		"toEndpoints": []interface{}{
+			map[string]interface{}{
+				"matchLabels": map[string]interface{}{
+					"k8s:io.kubernetes.pod.namespace": "kube-system",
+					"k8s:k8s-app":                     "kube-dns",
+				},
+			},
+		},
+		"toPorts": []interface{}{
+			map[string]interface{}{
+				"ports": []interface{}{
+					map[string]interface{}{"port": "53", "protocol": "ANY"},
+				},
+				"rules": map[string]interface{}{
+					"dns": []interface{}{
+						map[string]interface{}{"matchPattern": "*"},
+					},
+				},
+			},
+		},
+	}
+}
+
+// fqdnEgressRule renders the toFQDNs section of an EgressRule, or nil if it
+// declares no FQDNs. A leading "*." selects matchPattern (wildcard), otherwise
+// matchName (exact host).
+func fqdnEgressRule(rule infrav1.EgressRule) map[string]interface{} {
+	if len(rule.FQDNs) == 0 {
+		return nil
+	}
+	fqdns := make([]interface{}, 0, len(rule.FQDNs))
+	for _, name := range rule.FQDNs {
+		if strings.Contains(name, "*") {
+			fqdns = append(fqdns, map[string]interface{}{"matchPattern": name})
+		} else {
+			fqdns = append(fqdns, map[string]interface{}{"matchName": name})
+		}
+	}
+	out := map[string]interface{}{"toFQDNs": fqdns}
+	if tp := toPorts(rule.Ports); tp != nil {
+		out["toPorts"] = tp
+	}
+	return out
+}
+
+// cidrEgressRule renders the toCIDR section of an EgressRule, or nil if it
+// declares no CIDRs.
+func cidrEgressRule(rule infrav1.EgressRule) map[string]interface{} {
+	if len(rule.CIDRs) == 0 {
+		return nil
+	}
+	cidrs := make([]interface{}, 0, len(rule.CIDRs))
+	for _, c := range rule.CIDRs {
+		cidrs = append(cidrs, c)
+	}
+	out := map[string]interface{}{"toCIDR": cidrs}
+	if tp := toPorts(rule.Ports); tp != nil {
+		out["toPorts"] = tp
+	}
+	return out
+}
+
+// toPorts converts an EgressRule's port list into a Cilium toPorts block, or nil
+// when no ports are specified (meaning: all ports allowed).
+func toPorts(ports []infrav1.EgressPort) []interface{} {
+	if len(ports) == 0 {
+		return nil
+	}
+	entries := make([]interface{}, 0, len(ports))
+	for _, p := range ports {
+		proto := string(p.Protocol)
+		if proto == "" {
+			proto = "TCP"
+		}
+		entries = append(entries, map[string]interface{}{
+			"port":     fmt.Sprintf("%d", p.Port),
+			"protocol": proto,
+		})
+	}
+	return []interface{}{map[string]interface{}{"ports": entries}}
 }
 
 func (r *LabSessionReconciler) ensureNamespace(ctx context.Context, name string, owner *ctfcorev1.LabSession) error {
@@ -818,7 +986,12 @@ func (r *LabSessionReconciler) reconcileServiceResources(ctx context.Context, ns
 		return err
 	}
 
-	// 3. Создаем Service для доступа внутри кластера
+	// 3. Per-service egress allow-list (CiliumNetworkPolicy with toFQDNs/toCIDR).
+	if err := r.ensureServiceEgressPolicy(ctx, ns, labSvc, session); err != nil {
+		return err
+	}
+
+	// 4. Создаем Service для доступа внутри кластера
 	return r.ensureService(ctx, ns, labSvc, session)
 }
 
@@ -924,8 +1097,10 @@ func (r *LabSessionReconciler) buildEnvVars(labSvc *infrav1.LabService, session 
 			case "random":
 				val = generateRandomString(e.DynamicValue.Length)
 			case "hmac":
-				// Генерируем флаг на основе UserId и секрета системы
-				val = fmt.Sprintf(e.DynamicValue.Template, hash(labSvc.Name+session.Spec.UserId))
+				// Flag = platform format wrapping the per-team HMAC token. The
+				// format is platform-wide (CTF_FLAG_FORMAT) — NOT per-service —
+				// so it is set in one place and always matches CTFd's derivation.
+				val = fmt.Sprintf(flagFormat(), hash(labSvc.Name+session.Spec.UserId))
 			}
 		}
 
@@ -952,14 +1127,26 @@ func generateRandomString(n int) string {
 }
 
 // hash generating a deterministic string based on UserId and a secret
-// hash derives the flag digest. It MUST match CTFd's _derive_flag:
-// HMAC-SHA256(CTF_SCHOOL_SECRET, flagService+salt)[:12]. The secret comes from
-// the env so both sides share one source of truth (default kept for safety).
+// flagTokenLen is the length of the derived flag body (base64url chars). 24 of a
+// 64-symbol alphabet ≈ 2^144 entropy — far beyond brute-forcing.
+const flagTokenLen = 24
+
+// flagFormat is the platform-wide flag wrapper (a %s format). Set once via env
+// (the SAME value CTFd uses), so challenge authors never specify it. e.g.
+// CTF_FLAG_FORMAT="AlphaCTF{%s}".
+func flagFormat() string {
+	return envDefault("CTF_FLAG_FORMAT", "CTF{%s}")
+}
+
+// hash derives the flag token. It MUST match CTFd's _derive_flag exactly:
+// base64url(HMAC-SHA256(CTF_SCHOOL_SECRET, flagService+salt))[:flagTokenLen].
+// base64url is mixed-case alphanumeric (+ -_); the secret comes from env so both
+// sides share one source of truth.
 func hash(input string) string {
 	secret := envDefault("CTF_SCHOOL_SECRET", "ctf-school-secret-key")
 	h := hmac.New(sha256.New, []byte(secret))
 	h.Write([]byte(input))
-	return hex.EncodeToString(h.Sum(nil))[:12]
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))[:flagTokenLen]
 }
 
 func (r *LabSessionReconciler) createOrUpdatePod(ctx context.Context, pod *corev1.Pod) error {

@@ -60,6 +60,39 @@ type Exposure struct {
 	TargetPort string `json:"targetPort"`
 }
 
+// EgressPort restricts an EgressRule to a specific destination port/protocol.
+type EgressPort struct {
+	// Protocol is TCP or UDP. Defaults to TCP.
+	// +kubebuilder:validation:Enum=TCP;UDP
+	// +kubebuilder:default=TCP
+	// +optional
+	Protocol corev1.Protocol `json:"protocol,omitempty"`
+
+	// Port is the destination port number.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
+}
+
+// EgressRule allow-lists outbound traffic from a single LabService to a specific
+// external destination. Rules are additive and scoped to this service's pods only,
+// so one challenge can be granted a single API without opening the whole internet.
+type EgressRule struct {
+	// FQDNs is a list of DNS names the service may reach, e.g. "api.deepseek.com".
+	// A leading "*." wildcard is supported ("*.googleapis.com"). Enforced via the
+	// Cilium toFQDNs mechanism, which requires the Cilium CNI.
+	// +optional
+	FQDNs []string `json:"fqdns,omitempty"`
+
+	// CIDRs is a list of IP ranges the service may reach, e.g. "203.0.113.0/24".
+	// +optional
+	CIDRs []string `json:"cidrs,omitempty"`
+
+	// Ports restricts this rule to specific destination ports. Empty means all ports.
+	// +optional
+	Ports []EgressPort `json:"ports,omitempty"`
+}
+
 // LabServiceSpec defines the blueprint for a specific lab component.
 // Since this is a Cluster-scoped resource, it acts as a global template.
 type LabServiceSpec struct {
@@ -103,6 +136,14 @@ type LabServiceSpec struct {
 	// Resources defines CPU and Memory constraints for this service.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Egress is a per-service allow-list of external destinations this service may
+	// reach. It is additive on top of the LabSpace network policy and is scoped to
+	// this service's pods only: when empty the service gets no outbound internet
+	// access. Use it to grant a single API (e.g. DeepSeek) instead of opening the
+	// whole internet via LabSpace.Network.AllowInternet. Requires the Cilium CNI.
+	// +optional
+	Egress []EgressRule `json:"egress,omitempty"`
 }
 
 // +kubebuilder:object:root=true
