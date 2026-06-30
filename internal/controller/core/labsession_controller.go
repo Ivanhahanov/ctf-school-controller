@@ -114,7 +114,7 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	// Isolate the session namespace (Cilium enforces this): no cross-namespace
 	// traffic except the gateway/metrics ingress and DNS/internet egress.
-	if err := r.ensureNetworkPolicy(ctx, targetNamespace, space, session); err != nil {
+	if err := r.ensureBaselinePolicy(ctx, targetNamespace, space, session); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -363,56 +363,63 @@ func (r *LabSessionReconciler) maybeRestart(ctx context.Context, session *ctfcor
 	return true, nil
 }
 
-// nsSelector matches a namespace by its auto-applied metadata.name label.
-func nsSelector(name string) *metav1.LabelSelector {
-	return &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": name}}
-}
+// ensureBaselinePolicy locks a session namespace down to the minimum, expressed
+// as a single per-namespace CiliumNetworkPolicy (one engine, one source of truth).
+// Lab pods may talk to each other and to DNS, be reached by the gateway (workspace)
+// and by vmagent (metrics), and reach the public internet only when the LabSpace
+// sets AllowInternet — but cannot reach CTFd, the database, kube internals, or any
+// OTHER team's namespace. Because the policy selects every pod in both directions,
+// the namespace is default-deny: anything not listed here (or in a per-service
+// egress policy) is dropped. Per-service FQDN egress is layered on top.
+func (r *LabSessionReconciler) ensureBaselinePolicy(ctx context.Context, ns string, space *infrav1.LabSpace, session *ctfcorev1.LabSession) error {
+	// Migration: drop the legacy native NetworkPolicy now superseded by the CNP.
+	stale := &netv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "lab-isolation", Namespace: ns}}
+	if err := r.Delete(ctx, stale); err != nil && !errors.IsNotFound(err) {
+		return err
+	}
 
-// ensureNetworkPolicy locks a session namespace down to the minimum: a team's
-// lab pods can talk to each other and to DNS, can be reached by the gateway
-// (workspace) and by vmagent (metrics), and reach the internet only when the
-// LabSpace allows it — but cannot reach CTFd, the database, kube internals, or
-// any OTHER team's lab namespace. Cilium enforces it.
-func (r *LabSessionReconciler) ensureNetworkPolicy(ctx context.Context, ns string, space *infrav1.LabSpace, session *ctfcorev1.LabSession) error {
-	tcp, udp := corev1.ProtocolTCP, corev1.ProtocolUDP
-	guard := intstr.FromInt(int(guardPort))
-	dns := intstr.FromInt(53)
+	egress := []interface{}{
+		// intra-namespace: workspace <-> challenge services, services <-> services.
+		map[string]interface{}{"toEndpoints": []interface{}{map[string]interface{}{}}},
+		// DNS via kube-dns, with the L7 visibility Cilium's toFQDNs depends on
+		// (kept here once so per-service policies don't need to restate it).
+		dnsEgressRule(),
+	}
+	if space.Spec.Network.AllowInternet {
+		// Explicit "full egress" mode: everything outside the cluster. When set,
+		// per-service Egress allow-lists are redundant (world already covers them).
+		egress = append(egress, map[string]interface{}{
+			"toEntities": []interface{}{"world"},
+		})
+	}
 
-	np := &netv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "lab-isolation", Namespace: ns}}
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
-		if err := ctrl.SetControllerReference(session, np, r.Scheme); err != nil {
+	cnp := &unstructured.Unstructured{}
+	cnp.SetGroupVersionKind(ciliumNetworkPolicyGVK)
+	cnp.SetName("lab-baseline")
+	cnp.SetNamespace(ns)
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, cnp, func() error {
+		if err := ctrl.SetControllerReference(session, cnp, r.Scheme); err != nil {
 			return err
 		}
-		np.Spec = netv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{}, // all pods in the namespace
-			PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeIngress, netv1.PolicyTypeEgress},
-			Ingress: []netv1.NetworkPolicyIngressRule{
-				{From: []netv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}}}, // intra-namespace
-				{ // gateway (workspace) + vmagent (metrics) → guard port
-					From: []netv1.NetworkPolicyPeer{
-						{NamespaceSelector: nsSelector("envoy-gateway-system")},
-						{NamespaceSelector: nsSelector("monitoring")},
+		spec := map[string]interface{}{
+			"endpointSelector": map[string]interface{}{}, // all pods in THIS namespace
+			"ingress": []interface{}{
+				// intra-namespace (workspace reaches every service in its ns).
+				map[string]interface{}{"fromEndpoints": []interface{}{map[string]interface{}{}}},
+				// gateway (workspace UI) + vmagent (metrics) -> guard port.
+				map[string]interface{}{
+					"fromEndpoints": []interface{}{
+						map[string]interface{}{"matchLabels": map[string]interface{}{"k8s:io.kubernetes.pod.namespace": "envoy-gateway-system"}},
+						map[string]interface{}{"matchLabels": map[string]interface{}{"k8s:io.kubernetes.pod.namespace": "monitoring"}},
 					},
-					Ports: []netv1.NetworkPolicyPort{{Protocol: &tcp, Port: &guard}},
+					"toPorts": []interface{}{map[string]interface{}{
+						"ports": []interface{}{map[string]interface{}{"port": fmt.Sprintf("%d", guardPort), "protocol": "TCP"}},
+					}},
 				},
 			},
-			Egress: []netv1.NetworkPolicyEgressRule{
-				{To: []netv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}}}, // intra-namespace
-				{ // DNS
-					To:    []netv1.NetworkPolicyPeer{{NamespaceSelector: nsSelector("kube-system")}},
-					Ports: []netv1.NetworkPolicyPort{{Protocol: &udp, Port: &dns}, {Protocol: &tcp, Port: &dns}},
-				},
-			},
+			"egress": egress,
 		}
-		if space.Spec.Network.AllowInternet {
-			np.Spec.Egress = append(np.Spec.Egress, netv1.NetworkPolicyEgressRule{
-				To: []netv1.NetworkPolicyPeer{{IPBlock: &netv1.IPBlock{
-					CIDR:   "0.0.0.0/0",
-					Except: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
-				}}},
-			})
-		}
-		return nil
+		return unstructured.SetNestedField(cnp.Object, spec, "spec")
 	})
 	return err
 }
@@ -428,13 +435,13 @@ var ciliumNetworkPolicyGVK = schema.GroupVersionKind{
 
 // ensureServiceEgressPolicy renders a per-service CiliumNetworkPolicy that
 // allow-lists the exact external destinations declared in LabService.Spec.Egress
-// (FQDNs and/or CIDRs), scoped to that service's pods only. This is additive on
-// top of the namespace-wide lab-isolation policy, so it grants a single service
-// access to e.g. api.deepseek.com without opening LabSpace-wide AllowInternet.
+// (FQDNs and/or CIDRs), scoped to that service's pods only. It is purely additive:
+// the intra-namespace reachability, DNS (with the L7 visibility toFQDNs needs) and
+// the ingress path all come from the lab-baseline policy, so this object stays a
+// minimal, egress-only "exception" — easy to read in a security review.
 //
 // When the service declares no egress rules we delete any stale policy, keeping
-// the operation idempotent. FQDN matching relies on Cilium's DNS proxy, so every
-// policy also permits DNS to kube-dns with L7 visibility (rules.dns matchPattern).
+// the operation idempotent (e.g. after Egress is removed from the LabService).
 func (r *LabSessionReconciler) ensureServiceEgressPolicy(ctx context.Context, ns string, labSvc *infrav1.LabService, session *ctfcorev1.LabSession) error {
 	name := "egress-" + labSvc.Name
 	cnp := &unstructured.Unstructured{}
@@ -451,13 +458,7 @@ func (r *LabSessionReconciler) ensureServiceEgressPolicy(ctx context.Context, ns
 		return nil
 	}
 
-	// Base egress every service keeps: reach sibling pods/workspace in the same
-	// namespace, and resolve DNS via kube-dns (with the L7 visibility Cilium's
-	// toFQDNs needs). The external destinations follow.
-	egress := []interface{}{
-		map[string]interface{}{"toEndpoints": []interface{}{map[string]interface{}{}}},
-		dnsEgressRule(),
-	}
+	egress := []interface{}{}
 	for _, rule := range labSvc.Spec.Egress {
 		if e := fqdnEgressRule(rule); e != nil {
 			egress = append(egress, e)
@@ -474,20 +475,6 @@ func (r *LabSessionReconciler) ensureServiceEgressPolicy(ctx context.Context, ns
 		spec := map[string]interface{}{
 			"endpointSelector": map[string]interface{}{
 				"matchLabels": map[string]interface{}{"ctf.school/svc": labSvc.Name},
-			},
-			// Selecting an endpoint for egress puts it in egress default-deny. Adding
-			// any egress rule does NOT touch ingress, but a Cilium policy that also
-			// declares ingress flips the endpoint into ingress default-deny — so we
-			// must restate the intra-namespace allow here, otherwise the workspace
-			// (and sibling services) lose access to this service. This keeps the
-			// per-service policy self-contained instead of silently depending on the
-			// namespace-wide lab-isolation NetworkPolicy.
-			"ingress": []interface{}{
-				map[string]interface{}{
-					// Empty endpoint selector = every endpoint in THIS namespace
-					// (Cilium scopes it to the policy's namespace automatically).
-					"fromEndpoints": []interface{}{map[string]interface{}{}},
-				},
 			},
 			"egress": egress,
 		}
