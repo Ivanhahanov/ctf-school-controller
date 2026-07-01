@@ -70,6 +70,7 @@ func guardSidecar(space *infrav1.LabSpace, session *ctfcorev1.LabSession) corev1
 			{Name: "GUARD_UPSTREAM", Value: fmt.Sprintf("127.0.0.1:%d", workspaceWebPort(space))},
 			{Name: "GUARD_TEAM", Value: session.Spec.UserId},
 			{Name: "GUARD_SID", Value: session.Name},
+			{Name: "GUARD_LABSPACE", Value: session.Spec.LabSpaceRef}, // challenge → joins guard ↔ CTFd metrics
 			{Name: "GUARD_SECRET", Value: secret},
 			{Name: "GUARD_LOGIN_URL", Value: loginURL},
 		},
