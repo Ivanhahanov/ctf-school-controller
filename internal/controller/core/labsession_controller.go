@@ -32,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -60,7 +61,7 @@ type LabSessionReconciler struct {
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labsessions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labspaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=infra.ctf.school,resources=labservices;tasks,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=namespaces;pods;services;configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces;pods;services;configmaps;resourcequotas;limitranges,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cilium.io,resources=ciliumnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labsessions/finalizers,verbs=update
@@ -110,6 +111,15 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 5. Infrastructure Setup
 	targetNamespace := fmt.Sprintf("lab-session-%s", session.Name)
 	if err := r.ensureNamespace(ctx, targetNamespace, session); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Cap the whole namespace's aggregate resource usage from LabSpace.Spec.Resources,
+	// and seed per-container defaults so pods that omit resources are still admitted
+	// under the quota (workspace/guard/agent don't set their own requests/limits).
+	if err := r.ensureResourceQuota(ctx, targetNamespace, space, session); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.ensureLimitRange(ctx, targetNamespace, space, session); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Isolate the session namespace (Cilium enforces this): no cross-namespace
@@ -579,6 +589,16 @@ func (r *LabSessionReconciler) ensureNamespace(ctx context.Context, name string,
 				Name: name,
 				Labels: map[string]string{
 					"ctf.school/session-owner": owner.Name,
+					// Pod Security Admission: ENFORCE 'baseline' (blocks privileged,
+					// host namespaces, hostPath, extra caps — the desktop's root init
+					// still passes), and WARN/AUDIT against 'restricted' for visibility
+					// into what isn't yet fully locked down (the desktop container).
+					"pod-security.kubernetes.io/enforce":         "baseline",
+					"pod-security.kubernetes.io/enforce-version": "latest",
+					"pod-security.kubernetes.io/warn":            "restricted",
+					"pod-security.kubernetes.io/warn-version":    "latest",
+					"pod-security.kubernetes.io/audit":           "restricted",
+					"pod-security.kubernetes.io/audit-version":   "latest",
 				},
 			},
 		}
@@ -586,6 +606,81 @@ func (r *LabSessionReconciler) ensureNamespace(ctx context.Context, name string,
 	}
 	return err
 }
+
+// ensureResourceQuota caps the aggregate resource consumption of a session
+// namespace from LabSpace.Spec.Resources. The two ResourceLists are mapped onto
+// the quota's prefixed counters: Requests -> requests.<res>, Limits -> limits.<res>
+// (so cpu/memory become requests.cpu, limits.memory, … — the names a ResourceQuota
+// expects). If neither is set the namespace stays unbounded (no quota object). The
+// quota is reconciled in place, so editing the LabSpace re-tightens live sessions.
+//
+// NOTE: once limits.* / requests.* are enforced, every pod in the namespace must
+// declare the matching limits/requests or its creation is rejected. The workspace,
+// guard and agent containers don't set their own — ensureLimitRange supplies the
+// per-container defaults that satisfy this.
+func (r *LabSessionReconciler) ensureResourceQuota(ctx context.Context, ns string, space *infrav1.LabSpace, owner *ctfcorev1.LabSession) error {
+	hard := corev1.ResourceList{}
+	for name, qty := range space.Spec.Resources.Requests {
+		hard[corev1.ResourceName("requests."+string(name))] = qty
+	}
+	for name, qty := range space.Spec.Resources.Limits {
+		hard[corev1.ResourceName("limits."+string(name))] = qty
+	}
+	if len(hard) == 0 {
+		return nil
+	}
+
+	quota := &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: "lab-quota", Namespace: ns}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, quota, func() error {
+		if quota.Labels == nil {
+			quota.Labels = map[string]string{}
+		}
+		quota.Labels["ctf.school/session-owner"] = owner.Name
+		quota.Spec.Hard = hard
+		return nil
+	})
+	return err
+}
+
+// ensureLimitRange seeds per-container default requests/limits in the session
+// namespace. It is the companion to ensureResourceQuota: a ResourceQuota that caps
+// limits.cpu/limits.memory makes the API server REJECT any container that lacks
+// those values, and the workspace/guard/agent containers don't set them. The
+// LimitRange auto-injects these defaults so such pods are admitted and counted.
+// Only created when the quota is (Resources has requests or limits); otherwise the
+// namespace is unbounded and no defaults are needed.
+//
+// The defaults are deliberately modest. They are a floor to keep pods schedulable,
+// NOT the sizing — that's LabSpace.Spec.Resources (the aggregate cap). If a
+// LabSpace's cap is too small for a full desktop + guard + challenge pods, raise it
+// there; the LimitRange only decides what an individual container gets by default.
+func (r *LabSessionReconciler) ensureLimitRange(ctx context.Context, ns string, space *infrav1.LabSpace, owner *ctfcorev1.LabSession) error {
+	if len(space.Spec.Resources.Requests) == 0 && len(space.Spec.Resources.Limits) == 0 {
+		return nil
+	}
+
+	lr := &corev1.LimitRange{ObjectMeta: metav1.ObjectMeta{Name: "lab-defaults", Namespace: ns}}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, lr, func() error {
+		if lr.Labels == nil {
+			lr.Labels = map[string]string{}
+		}
+		lr.Labels["ctf.school/session-owner"] = owner.Name
+		lr.Spec.Limits = []corev1.LimitRangeItem{{
+			Type: corev1.LimitTypeContainer,
+			Default: corev1.ResourceList{ // limits when a container omits them (sized for the desktop)
+				corev1.ResourceCPU:    resource.MustParse("1"),
+				corev1.ResourceMemory: resource.MustParse("2Gi"),
+			},
+			DefaultRequest: corev1.ResourceList{ // requests when a container omits them
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
+			},
+		}}
+		return nil
+	})
+	return err
+}
+
 // workspaceHostname is the per-session external host for the workspace. It must
 // be unique per LabSession (session.Name already is: lab-<salt>-c<challengeID>),
 // otherwise two challenges sharing a LabSpace would produce colliding HTTPRoutes.
@@ -708,6 +803,7 @@ func (r *LabSessionReconciler) reconcileWorkspace(
 			TerminationGracePeriodSeconds: ptrInt64(labPodGraceSeconds),
 		},
 	}
+	hardenPod(&workspacePod.Spec)
 
 	if err := ctrl.SetControllerReference(session, workspacePod, r.Scheme); err != nil {
 		return err
@@ -793,9 +889,18 @@ func (r *LabSessionReconciler) buildWorkspaceInterface(space *infrav1.LabSpace, 
 		container.Env = append(container.Env,
 			corev1.EnvVar{Name: "VNC_COL_DEPTH", Value: "24"},
 			corev1.EnvVar{Name: "VNC_RESOLUTION", Value: "1280x1024"},
-			corev1.EnvVar{Name: "VNC_PW", Value: "vncpassword"}, // Пароль по умолчанию, если нужен
+			corev1.EnvVar{Name: "VNC_PW", Value: vncPassword(sess)}, // per-session, secret-derived (not hardcoded)
 		)
 	}
+
+	// The desktop container's hardening: an author-supplied profile, else the desktop
+	// default (root/writable/default-caps — the current images need it). Everything not
+	// covered here is still enforced at the pod level by hardenPod.
+	profile := space.Spec.Workspace.Security
+	if profile == nil {
+		profile = desktopDefaultProfile
+	}
+	container.SecurityContext = containerSecurityContext(profile)
 
 	return container
 }
@@ -807,43 +912,19 @@ func (r *LabSessionReconciler) buildGlobalChecker(
 ) corev1.Container {
 	allEnv := r.mergeTaskEnvs(tasks, session)
 
-	// Добавляем переменные для провизии S3 и аутентификации токена
+	// S3 provisioning + token/flag secrets for the checker agent. NOTHING is hardcoded:
+	// endpoint/bucket are config (env-overridable), S3 credentials come from the
+	// controller's own env (a mounted Secret), and the two HMAC keys reuse the split
+	// secrets so the agent's flag derivation matches CTFd (HMAC_SECRET = flagSecret) and
+	// its token signing matches the guard (AGENT_TOKEN_SECRET = jwtSecret).
 	allEnv = append(allEnv,
-		// Провизия тасок при старте агента
-		corev1.EnvVar{Name: "S3_ENDPOINT", Value: "http://seaweedfs-s3.default:8333"},
-		corev1.EnvVar{Name: "S3_BUCKET", Value: "ctf"},
-		corev1.EnvVar{Name: "S3_KEY", Value: s3Key}, // передавать через аргумент
-		corev1.EnvVar{Name: "S3_ACCESS_KEY", Value: "YourSWUser"},
-		corev1.EnvVar{Name: "S3_SECRET_KEY", Value: "NjZhOGFmYjdlYTI1NjljZDUyMGRlNjk1"},
-
-		// Секрет для HMAC-токенов — тот же что знает API
-		// В продакшене читать из k8s Secret, не хардкодить
-		// corev1.EnvVar{
-		// 	Name: "AGENT_TOKEN_SECRET",
-		// 	ValueFrom: &corev1.EnvVarSource{
-		// 		SecretKeyRef: &corev1.SecretKeySelector{
-		// 			LocalObjectReference: corev1.LocalObjectReference{Name: "ctf-agent-secret"},
-		// 			Key:                  "token-secret",
-		// 		},
-		// 	},
-		// },
-		// // HMAC_SECRET и USER_SALT для генерации флагов — как раньше
-		// corev1.EnvVar{
-		// 	Name: "HMAC_SECRET",
-		// 	ValueFrom: &corev1.EnvVarSource{
-		// 		SecretKeyRef: &corev1.SecretKeySelector{
-		// 			LocalObjectReference: corev1.LocalObjectReference{Name: "ctf-agent-secret"},
-		// 			Key:                  "hmac-secret",
-		// 		},
-		// 	},
-		// },
-		corev1.EnvVar{
-			Name: "AGENT_TOKEN_SECRET", Value: "test",
-		},
-		// HMAC_SECRET и USER_SALT для генерации флагов — как раньше
-		corev1.EnvVar{
-			Name: "HMAC_SECRET", Value: "test",
-		},
+		corev1.EnvVar{Name: "S3_ENDPOINT", Value: envDefault("CTF_S3_ENDPOINT", "http://seaweedfs-s3.default:8333")},
+		corev1.EnvVar{Name: "S3_BUCKET", Value: envDefault("CTF_S3_BUCKET", "ctf")},
+		corev1.EnvVar{Name: "S3_KEY", Value: s3Key},
+		corev1.EnvVar{Name: "S3_ACCESS_KEY", Value: os.Getenv("CTF_S3_ACCESS_KEY")},
+		corev1.EnvVar{Name: "S3_SECRET_KEY", Value: os.Getenv("CTF_S3_SECRET_KEY")},
+		corev1.EnvVar{Name: "AGENT_TOKEN_SECRET", Value: jwtSecret()},
+		corev1.EnvVar{Name: "HMAC_SECRET", Value: flagSecret()},
 		corev1.EnvVar{Name: "USER_SALT", Value: session.Spec.UserId},
 	)
 
@@ -913,6 +994,31 @@ func (r *LabSessionReconciler) reconcileServiceResources(ctx context.Context, ns
 	envVars := r.buildEnvVars(labSvc, session)
 
 	// 2. Создаем Pod (упрощенно, можно использовать Deployment для надежности)
+	challenge := corev1.Container{
+		Name:            "challenge",
+		Image:           labSvc.Spec.Image,
+		ImagePullPolicy: labSvc.Spec.ImagePullPolicy,
+		Command:         labSvc.Spec.Command,
+		Args:            labSvc.Spec.Args,
+		Ports:           labSvc.Spec.Ports,
+		Env:             envVars,
+		Resources:       labSvc.Spec.Resources,
+		LivenessProbe:   labSvc.Spec.Liveness,
+		ReadinessProbe:  labSvc.Spec.Readiness,
+		SecurityContext: containerSecurityContext(labSvc.Spec.Security),
+	}
+
+	var volumes []corev1.Volume
+	// A read-only root filesystem is the default; give the container a writable
+	// scratch /tmp (emptyDir) so well-behaved images still work without opting out.
+	if labSvc.Spec.Security == nil || !labSvc.Spec.Security.WritableRootFilesystem {
+		volumes = append(volumes, corev1.Volume{
+			Name:         "tmp",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
+		challenge.VolumeMounts = append(challenge.VolumeMounts, corev1.VolumeMount{Name: "tmp", MountPath: "/tmp"})
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      labSvc.Name,
@@ -925,22 +1031,11 @@ func (r *LabSessionReconciler) reconcileServiceResources(ctx context.Context, ns
 		},
 		Spec: corev1.PodSpec{
 			TerminationGracePeriodSeconds: ptrInt64(labPodGraceSeconds),
-			Containers: []corev1.Container{
-				{
-					Name:            "challenge",
-					Image:           labSvc.Spec.Image,
-					ImagePullPolicy: labSvc.Spec.ImagePullPolicy,
-					Command:         labSvc.Spec.Command,
-					Args:            labSvc.Spec.Args,
-					Ports:           labSvc.Spec.Ports,
-					Env:             envVars,
-					Resources:       labSvc.Spec.Resources,
-					LivenessProbe:   labSvc.Spec.Liveness,
-					ReadinessProbe:  labSvc.Spec.Readiness,
-				},
-			},
+			Volumes:                       volumes,
+			Containers:                    []corev1.Container{challenge},
 		},
 	}
+	hardenPod(&pod.Spec)
 
 	// switch labSvc.Spec.Exposure.Type {
 	// case "Terminal":
@@ -1057,6 +1152,78 @@ func (r *LabSessionReconciler) reconcileRoute(ctx context.Context, ns string, la
 func ptrString(s string) *string { return &s }
 func ptrInt32(i int32) *int32    { return &i }
 func ptrInt64(i int64) *int64    { return &i }
+func ptrBool(b bool) *bool       { return &b }
+
+// desktopDefaultProfile is the security profile for the workspace DESKTOP container.
+// The workspace is an OFFENSIVE environment — players run nmap (SYN scans need
+// CAP_NET_RAW), tcpdump, setuid tools (ping/sudo), bind ports, and write tool output —
+// so it runs as root with the container runtime's default capability set (which
+// includes NET_RAW) and a writable root filesystem. This is BY DESIGN, not a gap: the
+// security boundary for a workspace is CONTAINMENT, not the in-container uid. What must
+// hold — and is enforced by hardenPod + the namespace PSA 'baseline' + the Cilium
+// network policy — is that the player cannot ESCAPE the box: NO privileged, NO host
+// namespaces, NO hostPath, NO CAP_SYS_ADMIN, no service-account token, RuntimeDefault
+// seccomp (blocks mount/bpf/keyctl escape syscalls), and network isolation to their own
+// namespace + allowed egress. A challenge that needs extra tooling caps (e.g. NET_ADMIN,
+// SYS_PTRACE) sets LabSpace.spec.workspace.security.addCapabilities — note that goes
+// beyond PSA 'baseline', so such a namespace must relax enforcement.
+var desktopDefaultProfile = &infrav1.SecurityProfile{
+	AllowRunAsRoot:           true,
+	WritableRootFilesystem:   true,
+	KeepDefaultCapabilities:  true, // keeps NET_RAW etc. for scanning/packet tools
+	AllowPrivilegeEscalation: true, // setuid tools (ping/sudo) + the entrypoint's `su`
+}
+
+// containerSecurityContext renders a container SecurityContext from a SecurityProfile.
+// A nil profile is the strictest possible: non-root (uid 1000), no privilege
+// escalation, ALL capabilities dropped, read-only root fs, RuntimeDefault seccomp.
+// Each profile field opts out of exactly one control (secure-by-default).
+func containerSecurityContext(p *infrav1.SecurityProfile) *corev1.SecurityContext {
+	if p == nil {
+		p = &infrav1.SecurityProfile{}
+	}
+	sc := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptrBool(p.AllowPrivilegeEscalation),
+		ReadOnlyRootFilesystem:   ptrBool(!p.WritableRootFilesystem),
+		SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+	}
+	if p.Privileged {
+		sc.Privileged = ptrBool(true)
+	}
+	if p.SeccompUnconfined {
+		sc.SeccompProfile.Type = corev1.SeccompProfileTypeUnconfined
+	}
+	if p.KeepDefaultCapabilities {
+		if len(p.AddCapabilities) > 0 {
+			sc.Capabilities = &corev1.Capabilities{Add: p.AddCapabilities}
+		}
+	} else {
+		sc.Capabilities = &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}, Add: p.AddCapabilities}
+	}
+	if p.AllowRunAsRoot {
+		sc.RunAsNonRoot = ptrBool(false)
+		sc.RunAsUser = p.RunAsUser // nil = image default
+	} else {
+		uid := int64(1000)
+		if p.RunAsUser != nil && *p.RunAsUser != 0 {
+			uid = *p.RunAsUser
+		}
+		sc.RunAsNonRoot = ptrBool(true)
+		sc.RunAsUser = &uid
+	}
+	return sc
+}
+
+// hardenPod applies pod-level defaults every lab pod gets regardless of profile:
+// no service-account token (nothing here talks to the API), RuntimeDefault seccomp,
+// and no host namespaces (the zero value already keeps hostNetwork/PID/IPC off).
+func hardenPod(spec *corev1.PodSpec) {
+	spec.AutomountServiceAccountToken = ptrBool(false)
+	if spec.SecurityContext == nil {
+		spec.SecurityContext = &corev1.PodSecurityContext{}
+	}
+	spec.SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
+}
 
 // labPodGraceSeconds is the termination grace period for ephemeral lab pods.
 // The default of 30s makes Stop/Restart feel sluggish; these pods hold no state
@@ -1126,14 +1293,67 @@ func flagFormat() string {
 }
 
 // hash derives the flag token. It MUST match CTFd's _derive_flag exactly:
-// base64url(HMAC-SHA256(CTF_SCHOOL_SECRET, flagService+salt))[:flagTokenLen].
+// base64url(HMAC-SHA256(CTF_FLAG_SECRET, flagService+salt))[:flagTokenLen].
 // base64url is mixed-case alphanumeric (+ -_); the secret comes from env so both
 // sides share one source of truth.
 func hash(input string) string {
-	secret := envDefault("CTF_SCHOOL_SECRET", "ctf-school-secret-key")
-	h := hmac.New(sha256.New, []byte(secret))
+	h := hmac.New(sha256.New, []byte(flagSecret()))
 	h.Write([]byte(input))
 	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))[:flagTokenLen]
+}
+
+// flagSecret and jwtSecret are DISTINCT keys (security review finding #1): the flag-
+// derivation HMAC key and the workspace-token (HS256) key. Keeping them separate means
+// a leak of the guard/token secret cannot forge flags, and a leaked flag secret cannot
+// mint workspace tokens. Both fall back to the legacy shared CTF_SCHOOL_SECRET during
+// migration — the controller and CTFd fall back identically, so flags/tokens never
+// drift while a cluster is still on the single secret. Prod sets the split values.
+func flagSecret() string {
+	return firstNonEmpty(os.Getenv("CTF_FLAG_SECRET"), os.Getenv("CTF_SCHOOL_SECRET"), devSecretDefault)
+}
+
+func jwtSecret() string {
+	return firstNonEmpty(os.Getenv("CTF_JWT_SECRET"), os.Getenv("CTF_SCHOOL_SECRET"), devSecretDefault)
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// devSecretDefault is the compiled-in fallback used only for local dev. If it (or an
+// empty value) is what a secret resolves to at runtime, the platform is misconfigured.
+const devSecretDefault = "ctf-school-secret-key"
+
+// ValidateSecrets is a fail-closed startup guard (security review #1/#2 follow-up): it
+// refuses to run if the flag or JWT secret is unset or still the built-in dev default,
+// so a deployment that forgot to wire the Secret can't silently fall back to a
+// source-code-known key (which would make every flag and workspace token forgeable).
+// Set CTF_ALLOW_DEV_SECRETS=true to permit the dev default for local `make run`.
+func ValidateSecrets() error {
+	if os.Getenv("CTF_ALLOW_DEV_SECRETS") == "true" {
+		return nil
+	}
+	for name, val := range map[string]string{"CTF_FLAG_SECRET": flagSecret(), "CTF_JWT_SECRET": jwtSecret()} {
+		if val == "" || val == devSecretDefault {
+			return fmt.Errorf("%s is unset or the built-in dev default; set a real secret (or a real CTF_SCHOOL_SECRET), "+
+				"or set CTF_ALLOW_DEV_SECRETS=true for local dev", name)
+		}
+	}
+	return nil
+}
+
+// vncPassword derives the desktop's VNC password per session — stable across reconciles
+// (so it doesn't churn the pod), unique per session, and not a hardcoded literal. Our
+// own desktop images ignore it; it only matters for the accetto fallback image.
+func vncPassword(session *ctfcorev1.LabSession) string {
+	mac := hmac.New(sha256.New, []byte(jwtSecret()))
+	mac.Write([]byte("vnc-pw:" + session.Name))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))[:16]
 }
 
 func (r *LabSessionReconciler) createOrUpdatePod(ctx context.Context, pod *corev1.Pod) error {

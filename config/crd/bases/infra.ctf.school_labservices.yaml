@@ -41,16 +41,28 @@ spec:
           spec:
             description: Spec defines the configuration of the service blueprint.
             properties:
+              args:
+                description: Args are the arguments passed to the command.
+                items:
+                  type: string
+                type: array
+              command:
+                description: Command overrides the container entrypoint.
+                items:
+                  type: string
+                type: array
               egress:
                 description: |-
-                  Egress is a per-service allow-list of external destinations this
-                  service may reach. Additive on top of the LabSpace network policy and
-                  scoped to this service's pods only; empty means no outbound internet
-                  access. Requires the Cilium CNI.
+                  Egress is a per-service allow-list of external destinations this service may
+                  reach. It is additive on top of the LabSpace network policy and is scoped to
+                  this service's pods only: when empty the service gets no outbound internet
+                  access. Use it to grant a single API (e.g. DeepSeek) instead of opening the
+                  whole internet via LabSpace.Network.AllowInternet. Requires the Cilium CNI.
                 items:
                   description: |-
-                    EgressRule allow-lists outbound traffic from a single LabService
-                    to a specific external destination.
+                    EgressRule allow-lists outbound traffic from a single LabService to a specific
+                    external destination. Rules are additive and scoped to this service's pods only,
+                    so one challenge can be granted a single API without opening the whole internet.
                   properties:
                     cidrs:
                       description: CIDRs is a list of IP ranges the service may reach,
@@ -60,8 +72,9 @@ spec:
                       type: array
                     fqdns:
                       description: |-
-                        FQDNs is a list of DNS names the service may reach, e.g.
-                        "api.deepseek.com". A leading "*." wildcard is supported.
+                        FQDNs is a list of DNS names the service may reach, e.g. "api.deepseek.com".
+                        A leading "*." wildcard is supported ("*.googleapis.com"). Enforced via the
+                        Cilium toFQDNs mechanism, which requires the Cilium CNI.
                       items:
                         type: string
                       type: array
@@ -151,16 +164,6 @@ spec:
                 - targetPort
                 - type
                 type: object
-              args:
-                description: Args are the arguments passed to the command.
-                items:
-                  type: string
-                type: array
-              command:
-                description: Command overrides the container entrypoint.
-                items:
-                  type: string
-                type: array
               image:
                 description: Image is the Docker image repository and tag.
                 type: string
@@ -572,6 +575,55 @@ spec:
                       otherwise to an implementation-defined value. Requests cannot exceed Limits.
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
+                type: object
+              security:
+                description: |-
+                  Security relaxes the platform's secure-by-default pod hardening for THIS service.
+                  When absent the container is fully locked down (see SecurityProfile). Relax only
+                  what the workload genuinely needs — every field defaults to the secure setting.
+                properties:
+                  addCapabilities:
+                    description: |-
+                      AddCapabilities are Linux capabilities to add back on top of the dropped set.
+                      Keep minimal (e.g. NET_BIND_SERVICE). Default: none.
+                    items:
+                      description: Capability represent POSIX capabilities type
+                      type: string
+                    type: array
+                  allowPrivilegeEscalation:
+                    description: |-
+                      AllowPrivilegeEscalation permits gaining more privileges than the parent process
+                      (setuid binaries / file capabilities). Default false (no-new-privs).
+                    type: boolean
+                  allowRunAsRoot:
+                    description: AllowRunAsRoot lets the container run as UID 0 (disables
+                      runAsNonRoot).
+                    type: boolean
+                  keepDefaultCapabilities:
+                    description: |-
+                      KeepDefaultCapabilities skips the "drop ALL capabilities" default and keeps the
+                      container runtime's default set. Coarse — prefer AddCapabilities. Default false.
+                    type: boolean
+                  privileged:
+                    description: |-
+                      Privileged runs a fully privileged container — near-host access. DANGEROUS and
+                      blocked by the namespace Pod Security 'baseline' enforcement; use only on a
+                      cluster that permits it. Default false.
+                    type: boolean
+                  runAsUser:
+                    description: RunAsUser pins a specific UID. When unset the strict
+                      default is 1000.
+                    format: int64
+                    type: integer
+                  seccompUnconfined:
+                    description: SeccompUnconfined disables the RuntimeDefault seccomp
+                      profile. Default false.
+                    type: boolean
+                  writableRootFilesystem:
+                    description: |-
+                      WritableRootFilesystem disables the read-only root filesystem. Prefer mounting an
+                      emptyDir on the specific writable path instead. Default false (root fs read-only).
+                    type: boolean
                 type: object
             required:
             - image

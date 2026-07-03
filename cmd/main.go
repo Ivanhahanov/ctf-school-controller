@@ -97,6 +97,14 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	// Fail closed: refuse to start if the flag/JWT secrets are unset or the built-in
+	// dev default (unless CTF_ALLOW_DEV_SECRETS=true), so a misconfigured deployment
+	// can't silently fall back to a source-code-known key.
+	if err := corecontroller.ValidateSecrets(); err != nil {
+		setupLog.Error(err, "insecure secret configuration; refusing to start")
+		os.Exit(1)
+	}
+
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
 	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and

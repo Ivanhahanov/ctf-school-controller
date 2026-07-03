@@ -44,6 +44,14 @@ type WorkspaceConfig struct {
 	// Defaults to 6901 for VNC and 7681 for Terminal when unset.
 	// +optional
 	Port int32 `json:"port,omitempty"`
+
+	// Security relaxes the desktop container's hardening. The current desktop images
+	// initialise as root (useradd/chown, X11), so when this is absent the controller
+	// applies a documented desktop default (root + writable rootfs + default caps),
+	// while the guard sidecar and all challenge services stay fully locked down. Set
+	// this to tighten further once the image can run rootless.
+	// +optional
+	Security *SecurityProfile `json:"security,omitempty"`
 }
 
 // NetworkConfig defines the network isolation rules for the lab session.

@@ -1,12 +1,8 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  labels:
-    control-plane: controller-manager
-    app.kubernetes.io/name: controller
-    app.kubernetes.io/managed-by: kustomize
-  name: system
----
+# NOTE: the controller-system Namespace is NOT created here. In the CTF School
+# platform it is created by the shared `infrastructure` Kustomization, so it exists
+# before the dev secret and this Deployment need it (a single owner avoids the Flux
+# bootstrap race). For a stand-alone `make deploy`, create the namespace first:
+#   kubectl create namespace controller-system
 apiVersion: apps/v1
 kind: Deployment
 metadata:

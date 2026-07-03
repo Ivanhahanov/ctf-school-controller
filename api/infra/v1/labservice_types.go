@@ -144,6 +144,58 @@ type LabServiceSpec struct {
 	// whole internet via LabSpace.Network.AllowInternet. Requires the Cilium CNI.
 	// +optional
 	Egress []EgressRule `json:"egress,omitempty"`
+
+	// Security relaxes the platform's secure-by-default pod hardening for THIS service.
+	// When absent the container is fully locked down (see SecurityProfile). Relax only
+	// what the workload genuinely needs — every field defaults to the secure setting.
+	// +optional
+	Security *SecurityProfile `json:"security,omitempty"`
+}
+
+// SecurityProfile is the per-workload security relaxation knob. The platform is
+// secure-by-default: a nil/empty profile yields the strictest container context —
+// runAsNonRoot (uid 1000), allowPrivilegeEscalation=false, all Linux capabilities
+// dropped, a read-only root filesystem, the RuntimeDefault seccomp profile, and no
+// mounted service-account token. Each field below OPTS OUT of one control, so a
+// workload only loosens exactly what it needs and nothing is silently permissive.
+type SecurityProfile struct {
+	// AllowRunAsRoot lets the container run as UID 0 (disables runAsNonRoot).
+	// +optional
+	AllowRunAsRoot bool `json:"allowRunAsRoot,omitempty"`
+
+	// RunAsUser pins a specific UID. When unset the strict default is 1000.
+	// +optional
+	RunAsUser *int64 `json:"runAsUser,omitempty"`
+
+	// AllowPrivilegeEscalation permits gaining more privileges than the parent process
+	// (setuid binaries / file capabilities). Default false (no-new-privs).
+	// +optional
+	AllowPrivilegeEscalation bool `json:"allowPrivilegeEscalation,omitempty"`
+
+	// Privileged runs a fully privileged container — near-host access. DANGEROUS and
+	// blocked by the namespace Pod Security 'baseline' enforcement; use only on a
+	// cluster that permits it. Default false.
+	// +optional
+	Privileged bool `json:"privileged,omitempty"`
+
+	// WritableRootFilesystem disables the read-only root filesystem. Prefer mounting an
+	// emptyDir on the specific writable path instead. Default false (root fs read-only).
+	// +optional
+	WritableRootFilesystem bool `json:"writableRootFilesystem,omitempty"`
+
+	// KeepDefaultCapabilities skips the "drop ALL capabilities" default and keeps the
+	// container runtime's default set. Coarse — prefer AddCapabilities. Default false.
+	// +optional
+	KeepDefaultCapabilities bool `json:"keepDefaultCapabilities,omitempty"`
+
+	// AddCapabilities are Linux capabilities to add back on top of the dropped set.
+	// Keep minimal (e.g. NET_BIND_SERVICE). Default: none.
+	// +optional
+	AddCapabilities []corev1.Capability `json:"addCapabilities,omitempty"`
+
+	// SeccompUnconfined disables the RuntimeDefault seccomp profile. Default false.
+	// +optional
+	SeccompUnconfined bool `json:"seccompUnconfined,omitempty"`
 }
 
 // +kubebuilder:object:root=true
