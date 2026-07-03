@@ -79,12 +79,14 @@ func guardSidecar(space *infrav1.LabSpace, session *ctfcorev1.LabSession) corev1
 		// ResourceQuota budget goes to the desktop, not to the LimitRange default.
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("10m"),
-				corev1.ResourceMemory: resource.MustParse("32Mi"),
+				corev1.ResourceCPU:              resource.MustParse("10m"),
+				corev1.ResourceMemory:           resource.MustParse("32Mi"),
+				corev1.ResourceEphemeralStorage: guardEphemeralRequest.DeepCopy(),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("200m"),
-				corev1.ResourceMemory: resource.MustParse("128Mi"),
+				corev1.ResourceCPU:              resource.MustParse("200m"),
+				corev1.ResourceMemory:           resource.MustParse("128Mi"),
+				corev1.ResourceEphemeralStorage: guardEphemeralLimit.DeepCopy(),
 			},
 		},
 		Env: []corev1.EnvVar{

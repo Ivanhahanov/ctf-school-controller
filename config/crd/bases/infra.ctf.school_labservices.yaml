@@ -517,8 +517,11 @@ spec:
                     type: integer
                 type: object
               resources:
-                description: Resources defines CPU and Memory constraints for this
-                  service.
+                description: |-
+                  Resources defines CPU/memory/ephemeral-storage constraints for this service.
+                  When no ephemeral-storage LIMIT is given the controller injects a conservative
+                  default so a challenge cannot fill node disk via its writable rootfs; set it
+                  explicitly here to raise or lower that cap for disk-heavy challenges.
                 properties:
                   claims:
                     description: |-
@@ -625,6 +628,15 @@ spec:
                       emptyDir on the specific writable path instead. Default false (root fs read-only).
                     type: boolean
                 type: object
+              storageLimit:
+                anyOf:
+                - type: integer
+                - type: string
+                description: |-
+                  StorageLimit caps the size of the container's writable /tmp scratch volume (an
+                  emptyDir mounted when the root filesystem stays read-only). Defaults to 256Mi.
+                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                x-kubernetes-int-or-string: true
             required:
             - image
             type: object

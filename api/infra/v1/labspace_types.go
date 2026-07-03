@@ -18,6 +18,7 @@ package v1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -52,6 +53,21 @@ type WorkspaceConfig struct {
 	// this to tighten further once the image can run rootless.
 	// +optional
 	Security *SecurityProfile `json:"security,omitempty"`
+
+	// Resources sets the CPU/memory/ephemeral-storage requests and limits for the
+	// desktop container. When unset the controller applies conservative defaults
+	// (see the reconciler). The ephemeral-storage LIMIT is important: the desktop
+	// runs with a writable root filesystem, so without it a runaway process could
+	// fill node disk and trigger DiskPressure eviction across the node. Any field
+	// left unset here is backfilled with the default for that field only.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// StorageLimit caps the size of the per-session /workspace scratch volume (an
+	// emptyDir). Writes past it fail with ENOSPC on that volume instead of eating
+	// the node's ephemeral storage. Defaults to 1Gi when unset.
+	// +optional
+	StorageLimit *resource.Quantity `json:"storageLimit,omitempty"`
 }
 
 // NetworkConfig defines the network isolation rules for the lab session.

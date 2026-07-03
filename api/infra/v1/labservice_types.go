@@ -18,6 +18,7 @@ package v1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -133,9 +134,17 @@ type LabServiceSpec struct {
 	// +optional
 	Args []string `json:"args,omitempty"`
 
-	// Resources defines CPU and Memory constraints for this service.
+	// Resources defines CPU/memory/ephemeral-storage constraints for this service.
+	// When no ephemeral-storage LIMIT is given the controller injects a conservative
+	// default so a challenge cannot fill node disk via its writable rootfs; set it
+	// explicitly here to raise or lower that cap for disk-heavy challenges.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// StorageLimit caps the size of the container's writable /tmp scratch volume (an
+	// emptyDir mounted when the root filesystem stays read-only). Defaults to 256Mi.
+	// +optional
+	StorageLimit *resource.Quantity `json:"storageLimit,omitempty"`
 
 	// Egress is a per-service allow-list of external destinations this service may
 	// reach. It is additive on top of the LabSpace network policy and is scoped to

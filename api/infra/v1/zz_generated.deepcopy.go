@@ -220,6 +220,11 @@ func (in *LabServiceSpec) DeepCopyInto(out *LabServiceSpec) {
 		copy(*out, *in)
 	}
 	in.Resources.DeepCopyInto(&out.Resources)
+	if in.StorageLimit != nil {
+		in, out := &in.StorageLimit, &out.StorageLimit
+		x := (*in).DeepCopy()
+		*out = &x
+	}
 	if in.Egress != nil {
 		in, out := &in.Egress, &out.Egress
 		*out = make([]EgressRule, len(*in))
@@ -540,6 +545,16 @@ func (in *WorkspaceConfig) DeepCopyInto(out *WorkspaceConfig) {
 		in, out := &in.Security, &out.Security
 		*out = new(SecurityProfile)
 		(*in).DeepCopyInto(*out)
+	}
+	if in.Resources != nil {
+		in, out := &in.Resources, &out.Resources
+		*out = new(corev1.ResourceRequirements)
+		(*in).DeepCopyInto(*out)
+	}
+	if in.StorageLimit != nil {
+		in, out := &in.StorageLimit, &out.StorageLimit
+		x := (*in).DeepCopy()
+		*out = &x
 	}
 }
 

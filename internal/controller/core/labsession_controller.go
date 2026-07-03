@@ -51,6 +51,87 @@ const (
 	sessionFinalizer = "core.ctf.school/finalizer"
 )
 
+// Conservative default disk budget for lab pods. Every value is a cap the
+// platform applies when the CRD leaves it unset, so no emptyDir or writable
+// rootfs is unbounded — a runaway process (large files, a "fork bomb" that
+// spools to disk) hits its own cap instead of filling node ephemeral storage
+// and triggering a node-wide DiskPressure eviction. Override per-CRD via
+// Workspace.Resources / Workspace.StorageLimit and LabService.Resources /
+// LabService.StorageLimit. NOTE: PID-exhaustion (a classic fork bomb) is a
+// separate lever — it needs a kubelet podPidsLimit at the node level, which is
+// not expressible in the PodSpec/CRD (tracked as a follow-up).
+var (
+	// Workspace desktop container: full GUI/terminal, writable rootfs.
+	defaultWorkspaceCPURequest       = resource.MustParse("250m")
+	defaultWorkspaceCPULimit         = resource.MustParse("1")
+	defaultWorkspaceMemRequest       = resource.MustParse("512Mi")
+	defaultWorkspaceMemLimit         = resource.MustParse("2Gi")
+	defaultWorkspaceEphemeralRequest = resource.MustParse("256Mi")
+	defaultWorkspaceEphemeralLimit   = resource.MustParse("1Gi")
+
+	// emptyDir SizeLimits (writes past these fail with ENOSPC on the volume).
+	defaultWorkspaceStorageLimit = resource.MustParse("1Gi")   // /workspace
+	defaultTasksStorageLimit     = resource.MustParse("512Mi") // /opt/tasks
+	defaultServiceTmpLimit       = resource.MustParse("256Mi") // challenge /tmp
+
+	// Challenge container: default ephemeral-storage limit (writable rootfs layer).
+	defaultServiceEphemeralLimit = resource.MustParse("512Mi")
+
+	// Session-namespace LimitRange per-container ephemeral-storage defaults. These
+	// admit pods that omit ephemeral-storage (e.g. the checker agent) when a quota
+	// enforces limits/requests.ephemeral-storage.
+	defaultLimitRangeEphemeralRequest = resource.MustParse("256Mi")
+	defaultLimitRangeEphemeralLimit   = resource.MustParse("1Gi")
+
+	// Guard sidecar: tiny distroless reverse proxy, read-only rootfs.
+	guardEphemeralRequest = resource.MustParse("16Mi")
+	guardEphemeralLimit   = resource.MustParse("64Mi")
+)
+
+// setDefaultQty fills list[name] with def only when the caller left it unset,
+// so author-supplied values always win over the platform default.
+func setDefaultQty(list corev1.ResourceList, name corev1.ResourceName, def resource.Quantity) {
+	if _, ok := list[name]; !ok {
+		list[name] = def.DeepCopy()
+	}
+}
+
+// workspaceResources builds the desktop container's requirements from the
+// author's Workspace.Resources, backfilling every unset field with its
+// conservative default. The ephemeral-storage limit is therefore always present
+// so the writable-rootfs desktop can never fill node disk.
+func workspaceResources(space *infrav1.LabSpace) corev1.ResourceRequirements {
+	res := corev1.ResourceRequirements{Requests: corev1.ResourceList{}, Limits: corev1.ResourceList{}}
+	if r := space.Spec.Workspace.Resources; r != nil {
+		for k, v := range r.Requests {
+			res.Requests[k] = v
+		}
+		for k, v := range r.Limits {
+			res.Limits[k] = v
+		}
+	}
+	setDefaultQty(res.Requests, corev1.ResourceCPU, defaultWorkspaceCPURequest)
+	setDefaultQty(res.Requests, corev1.ResourceMemory, defaultWorkspaceMemRequest)
+	setDefaultQty(res.Requests, corev1.ResourceEphemeralStorage, defaultWorkspaceEphemeralRequest)
+	setDefaultQty(res.Limits, corev1.ResourceCPU, defaultWorkspaceCPULimit)
+	setDefaultQty(res.Limits, corev1.ResourceMemory, defaultWorkspaceMemLimit)
+	setDefaultQty(res.Limits, corev1.ResourceEphemeralStorage, defaultWorkspaceEphemeralLimit)
+	return res
+}
+
+// serviceResources returns the challenge container's requirements: the author's
+// LabService.Resources with a default ephemeral-storage LIMIT injected when
+// absent, so a challenge can't fill node disk via its writable rootfs. CPU/memory
+// are left to the author and the namespace LimitRange.
+func serviceResources(labSvc *infrav1.LabService) corev1.ResourceRequirements {
+	res := *labSvc.Spec.Resources.DeepCopy()
+	if res.Limits == nil {
+		res.Limits = corev1.ResourceList{}
+	}
+	setDefaultQty(res.Limits, corev1.ResourceEphemeralStorage, defaultServiceEphemeralLimit)
+	return res
+}
+
 // LabSessionReconciler reconciles a LabSession object
 type LabSessionReconciler struct {
 	client.Client
@@ -668,12 +749,14 @@ func (r *LabSessionReconciler) ensureLimitRange(ctx context.Context, ns string, 
 		lr.Spec.Limits = []corev1.LimitRangeItem{{
 			Type: corev1.LimitTypeContainer,
 			Default: corev1.ResourceList{ // limits when a container omits them (sized for the desktop)
-				corev1.ResourceCPU:    resource.MustParse("1"),
-				corev1.ResourceMemory: resource.MustParse("2Gi"),
+				corev1.ResourceCPU:              resource.MustParse("1"),
+				corev1.ResourceMemory:           resource.MustParse("2Gi"),
+				corev1.ResourceEphemeralStorage: defaultLimitRangeEphemeralLimit.DeepCopy(),
 			},
 			DefaultRequest: corev1.ResourceList{ // requests when a container omits them
-				corev1.ResourceCPU:    resource.MustParse("100m"),
-				corev1.ResourceMemory: resource.MustParse("256Mi"),
+				corev1.ResourceCPU:              resource.MustParse("100m"),
+				corev1.ResourceMemory:           resource.MustParse("256Mi"),
+				corev1.ResourceEphemeralStorage: defaultLimitRangeEphemeralRequest.DeepCopy(),
 			},
 		}}
 		return nil
@@ -765,9 +848,17 @@ func (r *LabSessionReconciler) reconcileWorkspace(
 		return err
 	}
 
+	// Cap both scratch volumes so a runaway process can't fill node ephemeral
+	// storage. /workspace is player-controlled (StorageLimit), /opt/tasks holds the
+	// provisioned task archive (fixed default).
+	wsLimit := defaultWorkspaceStorageLimit
+	if l := space.Spec.Workspace.StorageLimit; l != nil {
+		wsLimit = *l
+	}
+	tasksLimit := defaultTasksStorageLimit
 	volumes := []corev1.Volume{
-		{Name: "workspace-storage", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		{Name: "tasks-storage", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: "workspace-storage", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &wsLimit}}},
+		{Name: "tasks-storage", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &tasksLimit}}},
 	}
 
 	// Добавляем агент (checker) ТОЛЬКО если это не VNC (или если тип Terminal)
@@ -869,6 +960,9 @@ func (r *LabSessionReconciler) buildWorkspaceInterface(space *infrav1.LabSpace, 
 		Image:           image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		WorkingDir:      "/workspace",
+		// Author-set Workspace.Resources with conservative defaults backfilled; the
+		// ephemeral-storage limit is always present (writable-rootfs desktop).
+		Resources: workspaceResources(space),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "workspace-storage", MountPath: "/workspace"},
 		},
@@ -1002,7 +1096,7 @@ func (r *LabSessionReconciler) reconcileServiceResources(ctx context.Context, ns
 		Args:            labSvc.Spec.Args,
 		Ports:           labSvc.Spec.Ports,
 		Env:             envVars,
-		Resources:       labSvc.Spec.Resources,
+		Resources:       serviceResources(labSvc),
 		LivenessProbe:   labSvc.Spec.Liveness,
 		ReadinessProbe:  labSvc.Spec.Readiness,
 		SecurityContext: containerSecurityContext(labSvc.Spec.Security),
@@ -1012,9 +1106,13 @@ func (r *LabSessionReconciler) reconcileServiceResources(ctx context.Context, ns
 	// A read-only root filesystem is the default; give the container a writable
 	// scratch /tmp (emptyDir) so well-behaved images still work without opting out.
 	if labSvc.Spec.Security == nil || !labSvc.Spec.Security.WritableRootFilesystem {
+		tmpLimit := defaultServiceTmpLimit
+		if l := labSvc.Spec.StorageLimit; l != nil {
+			tmpLimit = *l
+		}
 		volumes = append(volumes, corev1.Volume{
 			Name:         "tmp",
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &tmpLimit}},
 		})
 		challenge.VolumeMounts = append(challenge.VolumeMounts, corev1.VolumeMount{Name: "tmp", MountPath: "/tmp"})
 	}
