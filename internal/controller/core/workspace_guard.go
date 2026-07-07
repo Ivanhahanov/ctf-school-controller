@@ -67,6 +67,13 @@ func guardSidecar(space *infrav1.LabSpace, session *ctfcorev1.LabSession) corev1
 	// cookie when the player re-opens the lab.
 	loginURL := fmt.Sprintf("%s://%s/challenges", scheme, domain)
 
+	// Report-only anti-cheat evidence sink: the guard streams per-session telemetry
+	// to VictoriaLogs. Empty ⇒ evidence disabled (metrics still exposed on /metrics).
+	// Override with CTF_LOGS_URL to point at a different VictoriaLogs.
+	logsURL := envDefault("CTF_LOGS_URL",
+		"http://vl-victoria-logs-single-server.monitoring.svc:9428"+
+			"/insert/jsonline?_stream_fields=team,labspace,sid&_msg_field=kind&_time_field=ts")
+
 	return corev1.Container{
 		Name:            "workspace-guard",
 		Image:           guardImage(),
@@ -92,10 +99,20 @@ func guardSidecar(space *infrav1.LabSpace, session *ctfcorev1.LabSession) corev1
 		Env: []corev1.EnvVar{
 			{Name: "GUARD_UPSTREAM", Value: fmt.Sprintf("127.0.0.1:%d", workspaceWebPort(space))},
 			{Name: "GUARD_TEAM", Value: session.Spec.UserId},
+			// Human-readable team/owner name (from the CTFd-stamped annotation) so
+			// metrics + evidence show "Team Awesome", not the "t3" salt.
+			{Name: "GUARD_OWNER", Value: session.Annotations["ctf.school/owner"]},
 			{Name: "GUARD_SID", Value: session.Name},
 			{Name: "GUARD_LABSPACE", Value: session.Spec.LabSpaceRef}, // challenge → joins guard ↔ CTFd metrics
 			{Name: "GUARD_SECRET", Value: secret},
 			{Name: "GUARD_LOGIN_URL", Value: loginURL},
+			{Name: "GUARD_LOGS_URL", Value: logsURL},
+			// Log reconstructed keystrokes + clipboard to VictoriaLogs for a human
+			// anti-cheat verdict. Sensitive → gated by CTF_LOG_INPUT (default on here).
+			{Name: "GUARD_LOG_INPUT", Value: envDefault("CTF_LOG_INPUT", "true")},
+			// Max clipboard-paste size logged verbatim; larger or mostly-binary pastes
+			// (a program/binary piped into the desktop) are replaced by a size marker.
+			{Name: "GUARD_CLIP_MAX", Value: envDefault("CTF_CLIP_MAX", "2048")},
 			// Propagate the dev-secret opt-in so the guard's fail-closed check agrees
 			// with the controller's when running in local dev mode.
 			{Name: "CTF_ALLOW_DEV_SECRETS", Value: os.Getenv("CTF_ALLOW_DEV_SECRETS")},

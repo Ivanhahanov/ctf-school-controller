@@ -12,6 +12,7 @@ rules:
   - namespaces
   - pods
   - resourcequotas
+  - secrets
   - services
   verbs:
   - create

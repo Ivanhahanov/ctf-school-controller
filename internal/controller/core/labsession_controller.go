@@ -61,10 +61,15 @@ const (
 // separate lever — it needs a kubelet podPidsLimit at the node level, which is
 // not expressible in the PodSpec/CRD (tracked as a follow-up).
 var (
-	// Workspace desktop container: full GUI/terminal, writable rootfs.
-	defaultWorkspaceCPURequest       = resource.MustParse("250m")
+	// Workspace desktop container: full GUI/terminal, writable rootfs. The
+	// cpu/memory REQUESTS match the LimitRange defaults these pods used before they
+	// became explicit (100m / 256Mi) — existing LabSpace quotas are sized around
+	// that floor, so keep it here or a tight requests.memory quota rejects the pod
+	// (desktop request + guard 32Mi must fit). Raise headroom via the LimitS, not
+	// the requests, or bump the LabSpace quota.
+	defaultWorkspaceCPURequest       = resource.MustParse("100m")
 	defaultWorkspaceCPULimit         = resource.MustParse("1")
-	defaultWorkspaceMemRequest       = resource.MustParse("512Mi")
+	defaultWorkspaceMemRequest       = resource.MustParse("256Mi")
 	defaultWorkspaceMemLimit         = resource.MustParse("2Gi")
 	defaultWorkspaceEphemeralRequest = resource.MustParse("256Mi")
 	defaultWorkspaceEphemeralLimit   = resource.MustParse("1Gi")
@@ -142,7 +147,7 @@ type LabSessionReconciler struct {
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labsessions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labspaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=infra.ctf.school,resources=labservices;tasks,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=namespaces;pods;services;configmaps;resourcequotas;limitranges,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces;pods;services;configmaps;resourcequotas;limitranges;secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cilium.io,resources=ciliumnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core.ctf.school,resources=labsessions/finalizers,verbs=update
@@ -192,6 +197,11 @@ func (r *LabSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 5. Infrastructure Setup
 	targetNamespace := fmt.Sprintf("lab-session-%s", session.Name)
 	if err := r.ensureNamespace(ctx, targetNamespace, session); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Stamp the private task-registry pull secret into the session namespace (no-op when
+	// CTF_REGISTRY_PULLSECRET is unset — dev/kind pulls kind-loaded/public images).
+	if err := r.ensurePullSecret(ctx, targetNamespace, session); err != nil {
 		return ctrl.Result{}, err
 	}
 	// Cap the whole namespace's aggregate resource usage from LabSpace.Spec.Resources,
@@ -475,6 +485,17 @@ func (r *LabSessionReconciler) ensureBaselinePolicy(ctx context.Context, ns stri
 		// DNS via kube-dns, with the L7 visibility Cilium's toFQDNs depends on
 		// (kept here once so per-service policies don't need to restate it).
 		dnsEgressRule(),
+		// Anti-cheat evidence: the guard ships report-only telemetry to VictoriaLogs
+		// in the monitoring namespace (:9428). Narrow allow so it works even when the
+		// challenge itself has no internet egress.
+		map[string]interface{}{
+			"toEndpoints": []interface{}{
+				map[string]interface{}{"matchLabels": map[string]interface{}{"k8s:io.kubernetes.pod.namespace": "monitoring"}},
+			},
+			"toPorts": []interface{}{map[string]interface{}{
+				"ports": []interface{}{map[string]interface{}{"port": "9428", "protocol": "TCP"}},
+			}},
+		},
 	}
 	if space.Spec.Network.AllowInternet {
 		// Explicit "full egress" mode: everything outside the cluster. When set,
@@ -658,6 +679,53 @@ func toPorts(ports []infrav1.EgressPort) []interface{} {
 		})
 	}
 	return []interface{}{map[string]interface{}{"ports": entries}}
+}
+
+// pullSecretName is the name of the dockerconfigjson Secret stamped into every session
+// namespace so kubelet can pull challenge images from the private task-registry.
+const pullSecretName = "task-registry-pull"
+
+// registryPullConfig returns the ~/.docker/config.json contents for the task-registry,
+// supplied to the controller via CTF_REGISTRY_PULLSECRET (a secretKeyRef in prod). Empty
+// = feature off: dev/kind kind-loads images, and public images need no auth.
+func registryPullConfig() string { return os.Getenv("CTF_REGISTRY_PULLSECRET") }
+
+// pullSecretRefs is what goes on a PodSpec.ImagePullSecrets — the stamped secret when the
+// feature is on, else nil (harmless to omit for kind-loaded/public images).
+func pullSecretRefs() []corev1.LocalObjectReference {
+	if registryPullConfig() == "" {
+		return nil
+	}
+	return []corev1.LocalObjectReference{{Name: pullSecretName}}
+}
+
+// ensurePullSecret create-or-updates the task-registry pull secret in a session
+// namespace. Owned by the (cluster-scoped) session, and the namespace is deleted on
+// session end, so it never leaks. No-op when the feature is off.
+func (r *LabSessionReconciler) ensurePullSecret(ctx context.Context, ns string, owner *ctfcorev1.LabSession) error {
+	cfg := registryPullConfig()
+	if cfg == "" {
+		return nil
+	}
+	desired := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: pullSecretName, Namespace: ns},
+		Type:       corev1.SecretTypeDockerConfigJson,
+		Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(cfg)},
+	}
+	if err := ctrl.SetControllerReference(owner, desired, r.Scheme); err != nil {
+		return err
+	}
+	found := &corev1.Secret{}
+	switch err := r.Get(ctx, client.ObjectKey{Name: pullSecretName, Namespace: ns}, found); {
+	case errors.IsNotFound(err):
+		return r.Create(ctx, desired)
+	case err != nil:
+		return err
+	default:
+		found.Type = desired.Type
+		found.Data = desired.Data
+		return r.Update(ctx, found)
+	}
 }
 
 func (r *LabSessionReconciler) ensureNamespace(ctx context.Context, name string, owner *ctfcorev1.LabSession) error {
@@ -891,6 +959,7 @@ func (r *LabSessionReconciler) reconcileWorkspace(
 		Spec: corev1.PodSpec{
 			Volumes:                       volumes,
 			Containers:                    containers,
+			ImagePullSecrets:              pullSecretRefs(),
 			TerminationGracePeriodSeconds: ptrInt64(labPodGraceSeconds),
 		},
 	}
@@ -1131,6 +1200,7 @@ func (r *LabSessionReconciler) reconcileServiceResources(ctx context.Context, ns
 			TerminationGracePeriodSeconds: ptrInt64(labPodGraceSeconds),
 			Volumes:                       volumes,
 			Containers:                    []corev1.Container{challenge},
+			ImagePullSecrets:              pullSecretRefs(),
 		},
 	}
 	hardenPod(&pod.Spec)
