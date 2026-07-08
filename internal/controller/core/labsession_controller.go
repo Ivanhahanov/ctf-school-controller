@@ -68,9 +68,9 @@ var (
 	// (desktop request + guard 32Mi must fit). Raise headroom via the LimitS, not
 	// the requests, or bump the LabSpace quota.
 	defaultWorkspaceCPURequest       = resource.MustParse("100m")
-	defaultWorkspaceCPULimit         = resource.MustParse("1")
+	defaultWorkspaceCPULimit         = resource.MustParse("2")    // was 1: Firefox/XFCE/noVNC burst past one core on page load; a hard 1-CPU cap caused CFS throttling (UI lag). Limits don't reserve, so raising it is free at schedule time.
 	defaultWorkspaceMemRequest       = resource.MustParse("256Mi")
-	defaultWorkspaceMemLimit         = resource.MustParse("2Gi")
+	defaultWorkspaceMemLimit         = resource.MustParse("2560Mi") // was 2Gi: a little OOM headroom for Firefox
 	defaultWorkspaceEphemeralRequest = resource.MustParse("256Mi")
 	defaultWorkspaceEphemeralLimit   = resource.MustParse("1Gi")
 

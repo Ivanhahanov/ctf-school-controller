@@ -91,8 +91,12 @@ func guardSidecar(space *infrav1.LabSpace, session *ctfcorev1.LabSession) corev1
 				corev1.ResourceEphemeralStorage: guardEphemeralRequest.DeepCopy(),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:              resource.MustParse("200m"),
-				corev1.ResourceMemory:           resource.MustParse("128Mi"),
+				// The guard reverse-proxies the whole noVNC stream, so its CPU cap sits in
+				// the desktop's hot path: heavy screen updates (scroll/video) can saturate a
+				// tight limit and stutter the session. 500m gives burst room; the request
+				// stays 10m so idle sessions still cost almost nothing.
+				corev1.ResourceCPU:              resource.MustParse("500m"),
+				corev1.ResourceMemory:           resource.MustParse("192Mi"),
 				corev1.ResourceEphemeralStorage: guardEphemeralLimit.DeepCopy(),
 			},
 		},
